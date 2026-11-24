@@ -180,6 +180,40 @@ impl GraphicsState {
         }
     }
 
+    /// The blend state for the host: without blending on targets of an
+    /// integer format. The console and D3D12 on Windows take such a state
+    /// and do not blend there (an integer target is written as the shader
+    /// gives it); vkd3d-proton refuses the whole pipeline ("Enabling
+    /// blending on RT 2 with format DXGI_FORMAT_R8_UINT, but using integer
+    /// format is not supported", E_INVALIDARG), so the title's draws with
+    /// it were dropped.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        // The UINT and SINT formats a target can have.
+        const INTEGER: [i32; 21] = [
+            3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64,
+        ];
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        // Without independent blending the first target's state is every
+        // target's.
+        let state = |blend: &D3D12_BLEND_DESC, n: usize| {
+            blend.RenderTarget[if blend.IndependentBlendEnable.as_bool() { n } else { 0 }]
+        };
+        let refused = (0..count)
+            .any(|n| INTEGER.contains(&self.targets.RTFormats[n].0) && state(&blend, n).BlendEnable.as_bool());
+        if refused {
+            let each: [_; 8] = std::array::from_fn(|n| state(&blend, n));
+            blend.RenderTarget = each;
+            blend.IndependentBlendEnable = true.into();
+            for n in 0..count {
+                if INTEGER.contains(&self.targets.RTFormats[n].0) {
+                    blend.RenderTarget[n].BlendEnable = false.into();
+                }
+            }
+        }
+        blend
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -605,7 +639,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -761,7 +795,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
