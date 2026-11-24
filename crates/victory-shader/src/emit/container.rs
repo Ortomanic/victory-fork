@@ -89,8 +89,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
             }
         }
     }
+    // It sorts by register alone (`std::sort`, an insertion sort for
+    // signatures this small): elements sharing a row stay in element order,
+    // whatever their columns.
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -415,5 +418,36 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(name: &str, row: u32, col: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 3,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    /// Rows sharing a register keep element order, as the validator's
+    /// signature writer leaves them (it sorts by register alone).
+    #[test]
+    fn rows_sort_by_register_alone() {
+        let sig = signature(
+            &[element("B", 1, 3), element("A", 1, 0), element("C", 0, 0)],
+            true,
+        );
+        let name = |k: usize| {
+            let off = crate::dxbc::u32_at(&sig, 8 + 32 * k + 4).unwrap() as usize;
+            let end = sig[off..].iter().position(|&b| b == 0).unwrap();
+            String::from_utf8(sig[off..off + end].to_vec()).unwrap()
+        };
+        assert_eq!([name(0), name(1), name(2)], ["C", "B", "A"]);
     }
 }
