@@ -7367,6 +7367,8 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// Made when planes are first composed.
+    composer: Option<crate::compose::Composer>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -7696,42 +7698,7 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
-                    return None;
-                }
-            };
-        }
-        let p = presenter.as_mut()?;
-        if (p.width, p.height, p.format) != (width, height, format) {
-            // Presents sent ahead hold back buffers until they have run.
-            settle_now(WHY_SYNC);
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
-            };
-            match resized {
-                Ok(()) => {
-                    (p.width, p.height, p.format) = (width, height, format);
-                    tracing::info!(
-                        width,
-                        height,
-                        format = format.0,
-                        frame,
-                        "the swap chain's buffers were made again for another size or format"
-                    );
-                    self.log_video_memory("right after the swap chain's buffers were made again");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
-                    return None;
-                }
-            }
-        }
+        let p = self.ready(&mut presenter, width, height, format, frame)?;
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -7809,6 +7776,165 @@ impl Host {
         }
     }
 
+    /// Shows `layers` (the planes, bottom first; see [`crate::compose`])
+    /// composed in our window, drawn at the window's client size (the
+    /// largest plane's while it has none). `Some(black)` as for
+    /// [`Host::present`]; `None` if nothing was shown.
+    pub(crate) fn compose(&self, layers: &[crate::compose::Layer], frame: u64) -> Option<bool> {
+        use crate::compose::OUTPUT;
+        if !crate::compose::available() {
+            return None;
+        }
+        let (width, height) = layers
+            .iter()
+            // SAFETY: live resources.
+            .map(|l| unsafe { l.texture.GetDesc() })
+            .map(|d| (d.Width as u32, d.Height))
+            .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))?;
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        // The window comes with the presenter, made at the largest plane's size.
+        let hwnd = match presenter.as_ref() {
+            Some(p) => p.hwnd,
+            None => self.ready(&mut presenter, width, height, OUTPUT, frame)?.hwnd,
+        };
+        let (width, height) = client_size(hwnd).unwrap_or((width, height));
+        let p = self.ready(&mut presenter, width, height, OUTPUT, frame)?;
+        if p.composer.is_none() {
+            p.composer = crate::compose::Composer::new(&self.device)
+                .inspect_err(|e| tracing::warn!(error = %e, "no plane composition descriptors"))
+                .ok();
+        }
+        let composer = p.composer.as_ref()?;
+        // SAFETY: our swap chain, list and heaps, and live plane textures.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let back = p.swap_chain.GetBuffer::<ID3D12Resource>(index).ok()?;
+            // Sent ahead as [`Host::present`] does ([`late_free_present`]),
+            // unless the frame is to be read back at once.
+            #[cfg(feature = "diagnostics")]
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let read_now = false;
+            let slot = if late_free_present() && !read_now {
+                let finished = FINISHED.load(Ordering::Acquire);
+                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                    let list = self.new_list().ok()?;
+                    list.close();
+                    p.ahead.push((list, 0));
+                    Some(p.ahead.len() - 1)
+                })
+            } else {
+                None
+            };
+            let copy = match slot {
+                Some(i) => &p.ahead[i].0,
+                None => &p.copy,
+            };
+            copy.reset();
+            let list = &copy.list;
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            composer.record(&self.device, list, &back, (width, height), layers);
+            #[cfg(feature = "diagnostics")]
+            let (capture, probe) = {
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, &back))
+                    .flatten();
+                let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, &back) };
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                (capture, probe)
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            {
+                let _ = frame;
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+            }
+            copy.close();
+            match slot {
+                Some(i) => {
+                    let flown = self.execute_own(copy);
+                    p.ahead[i].1 = flown;
+                }
+                None => self.execute(&[copy]),
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((buffer, footprint)) = capture {
+                crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            #[cfg(not(feature = "diagnostics"))]
+            Some(false)
+        }
+    }
+
+    /// The presenter, made or its swap chain resized to `width` by
+    /// `height` in `format` as needed.
+    fn ready<'a>(
+        &self,
+        presenter: &'a mut Option<Presenter>,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+        frame: u64,
+    ) -> Option<&'a mut Presenter> {
+        if presenter.is_none() {
+            *presenter = match self.presenter(width, height, format) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no swap chain");
+                    return None;
+                }
+            };
+        }
+        let p = presenter.as_mut()?;
+        if (p.width, p.height, p.format) != (width, height, format) {
+            // Presents sent ahead hold back buffers until they have run.
+            settle_now(WHY_SYNC);
+            // SAFETY: no back buffer is held; every submission was waited for.
+            let resized = unsafe {
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            };
+            match resized {
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    tracing::info!(
+                        width,
+                        height,
+                        format = format.0,
+                        frame,
+                        "the swap chain's buffers were made again for another size or format"
+                    );
+                    self.log_video_memory("right after the swap chain's buffers were made again");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    return None;
+                }
+            }
+        }
+        Some(p)
+    }
+
     fn presenter(
         &self,
         width: u32,
@@ -7850,11 +7976,21 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                composer: None,
                 hwnd,
                 meter: Meter::new(),
             })
         }
     }
+}
+
+/// A window's client area size; `None` while it has none (minimized).
+fn client_size(hwnd: HWND) -> Option<(u32, u32)> {
+    let mut rect = RECT::default();
+    // SAFETY: a window handle and our out pointer.
+    unsafe { GetClientRect(hwnd, &mut rect) }.ok()?;
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    (width > 0 && height > 0).then_some((width as u32, height as u32))
 }
 
 /// A visible top-level window of this process: the one the title made, if
