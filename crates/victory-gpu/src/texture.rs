@@ -66,6 +66,53 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Changes of guarded view memory that the guard did not see.
+    unseen: Unseen,
+}
+
+/// For a texture in guarded view memory: whether its bytes change with no
+/// write the guard sees (the title writes the same pages through another
+/// view). A movie's planes are such: the decoder rewrites one of three
+/// sets every frame and the guard notes nothing (one guard fault a frame
+/// in the intro, where a set is some 190 blocks). Left to the hash of
+/// every eighth frame, each set's host copy was refreshed once in 24
+/// frames while the title drew the sets in turn: the screen showed video
+/// frames k, k-2, k-1, k and so on, every picture repeated three frames
+/// apart (run splash1).
+///
+/// So a hash taken where the guard saw no write says which kind the
+/// texture is. If it finds the bytes changed, the texture is hashed at
+/// each of its next [`Unseen::CHECKS`] checks whatever the guard says, and
+/// every such change found starts that count again; found unchanged that
+/// many times in a row, it is left to the guard and its turn again. A new
+/// texture is hashed at its second check too (the first reads it in any
+/// case), so a movie is right from its second frame on, not from the
+/// first turn of each set.
+struct Unseen {
+    /// Checks left at which the memory is hashed though the guard saw no
+    /// write.
+    checks: u32,
+}
+
+impl Default for Unseen {
+    fn default() -> Self {
+        Unseen { checks: 1 }
+    }
+}
+
+impl Unseen {
+    const CHECKS: u32 = 16;
+
+    /// Whether the memory is hashed at a check where the guard saw no
+    /// write: on the texture's turn, or while changes unseen are expected.
+    fn hashes(&self, turn: bool) -> bool {
+        turn || self.checks > 0
+    }
+
+    /// What a hash found that was taken where the guard saw no write.
+    fn hashed(&mut self, changed: bool) {
+        self.checks = if changed { Self::CHECKS } else { self.checks.saturating_sub(1) };
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -646,6 +693,12 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        // A texture whose bytes change unseen by the guard is hashed at
+        // every check for a while ([`Unseen`]).
+        let mut quiet = false;
+        // Hashed for that alone (counted).
+        #[cfg(feature = "diagnostics")]
+        let mut unseen = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -654,8 +707,13 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !last.unseen.hashes(turn) {
                 return 0;
+            }
+            quiet = unwritten;
+            #[cfg(feature = "diagnostics")]
+            {
+                unseen = unwritten && !turn;
             }
         }
         // From here on the texture's memory may be read in place. Held until
@@ -715,6 +773,16 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if quiet {
+                    last.unseen.hashed(last.hash != Some(hash));
+                }
+                #[cfg(feature = "diagnostics")]
+                if unseen {
+                    crate::copystat::add(crate::copystat::C::TexUnseen, size as u64);
+                    if last.hash != Some(hash) {
+                        crate::copystat::add(crate::copystat::C::TexUnseenChanged, size as u64);
+                    }
+                }
                 if last.hash == Some(hash) {
                     return size;
                 }
@@ -731,6 +799,16 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        if quiet {
+            last.unseen.hashed(last.hash != Some(hash));
+        }
+        #[cfg(feature = "diagnostics")]
+        if unseen {
+            crate::copystat::add(crate::copystat::C::TexUnseen, size as u64);
+            if last.hash != Some(hash) {
+                crate::copystat::add(crate::copystat::C::TexUnseenChanged, size as u64);
+            }
+        }
         if last.hash == Some(hash) {
             return size;
         }
@@ -1053,6 +1131,56 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod unseen_tests {
+    use super::Unseen;
+
+    /// One check of a texture in guarded view memory where the guard saw
+    /// no write, as `Staging::refresh_timed` makes it: whether the memory
+    /// was hashed (and so a change of it found).
+    fn check(unseen: &mut Unseen, turn: bool, changed: bool) -> bool {
+        let hashed = unseen.hashes(turn);
+        if hashed {
+            unseen.hashed(changed);
+        }
+        hashed
+    }
+
+    /// A movie: three sets of planes, one rewritten each frame through a
+    /// view the guard does not see and drawn that frame. Each set's first
+    /// check reads it whatever the guard says; from the second on every
+    /// check must find the frame's picture, on a turn or not.
+    #[test]
+    fn planes_rewritten_unseen_are_read_at_every_check() {
+        let mut sets = [Unseen::default(), Unseen::default(), Unseen::default()];
+        for frame in 3..240u64 {
+            let set = (frame % 3) as usize;
+            let turn = (frame + set as u64).is_multiple_of(8);
+            assert!(check(&mut sets[set], turn, true), "frame {frame}: set {set} left as it was");
+        }
+    }
+
+    /// A texture that does not change costs one hash beside its turns;
+    /// one that changed unseen once is hashed at the next checks, and left
+    /// to its turns again when it stays as it is.
+    #[test]
+    fn a_still_texture_is_left_to_its_turns() {
+        let mut unseen = Unseen::default();
+        assert!(check(&mut unseen, false, false));
+        assert!((0..64).all(|_| !check(&mut unseen, false, false)));
+        // Its turn finds a change the guard did not see.
+        assert!(check(&mut unseen, true, true));
+        let hashed = (0..64).filter(|_| check(&mut unseen, false, false)).count();
+        assert_eq!(hashed, Unseen::CHECKS as usize);
+        // A change within that time starts it again.
+        assert!(check(&mut unseen, true, true));
+        assert!(check(&mut unseen, false, false));
+        assert!(check(&mut unseen, false, true));
+        let hashed = (0..64).filter(|_| check(&mut unseen, false, false)).count();
+        assert_eq!(hashed, Unseen::CHECKS as usize);
+    }
 }
 
 #[cfg(test)]
