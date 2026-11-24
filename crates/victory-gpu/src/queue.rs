@@ -1096,12 +1096,66 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A Scarlett present plane, 0x48 bytes: frame token, the plane's
+/// resources, then (as TuxBox's `RetailPresentPlane` reads a retail title's
+/// and rebox's notes name the GDK's `pSrcViewRects` and `ColorSpace`) a
+/// source rectangle per resource, the placement on the screen (left, top,
+/// right, bottom as fractions of it), the color space, and words not yet
+/// understood.
 #[repr(C)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+    destination: *const [f32; 4],
+    color_space: u32,
+    rest: [u32; 7],
+}
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+#[cfg(windows)]
+impl Plane {
+    /// The first resource, if the plane names one.
+    fn first(&self) -> Option<This> {
+        // SAFETY: the plane lists `count` resources.
+        (self.count > 0 && !self.resources.is_null()).then(|| unsafe { *self.resources })
+    }
+
+    /// The first resource's source rectangle (texels: left, top, right,
+    /// bottom), if the plane points at one that can be read.
+    fn source_rect(&self) -> Option<[i32; 4]> {
+        let mut bytes = [0u8; 16];
+        (!self.source_rects.is_null()
+            && crate::host::read_into(self.source_rects.cast(), &mut bytes))
+        .then(|| {
+            std::array::from_fn(|i| i32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap()))
+        })
+    }
+
+    /// The placement on the screen, if the plane points at one that can be
+    /// read.
+    fn placement(&self) -> Option<[f32; 4]> {
+        let mut bytes = [0u8; 16];
+        (!self.destination.is_null() && crate::host::read_into(self.destination.cast(), &mut bytes))
+            .then(|| {
+                std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap()))
+            })
+    }
+}
+
+/// `VICTORY_PRESENT_PLANE=0` or `1`: show that plane alone, for an A/B
+/// against composition.
+#[cfg(windows)]
+fn forced_plane() -> Option<u32> {
+    static FORCED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_PLANE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &u32| n < 2)
+    })
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -1263,10 +1317,11 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the title's planes in our window: two composed (see
+/// [`compose`]), otherwise the first plane's first resource copied as it is
+/// (or the plane `VICTORY_PRESENT_PLANE` names).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: a single plane is copied without scaling or placement.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1366,18 +1421,40 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
+            if !plane_parameters.is_null() && planes <= 16 {
+                for index in 0..planes as usize {
+                    // SAFETY: the title passes `planes` plane records.
+                    log_plane(frame, index, unsafe { &*plane_parameters.add(index) });
+                }
+            }
             crate::capture::dump_targets(frame);
         }
     }
     #[cfg(windows)]
+    // (A present sent behind its queue's line shows plane 0 by itself.)
+    if !sent_behind
+        && planes == 2
+        && forced_plane().is_none()
+        && !plane_parameters.is_null()
+        // SAFETY: the title passes two plane records.
+        && compose(unsafe { &*plane_parameters.cast::<[Plane; 2]>() }, frame)
+    {
+        return S_OK;
+    }
+    #[cfg(windows)]
+    let selected_plane = match forced_plane() {
+        // SAFETY: the title passes `planes` plane records.
+        Some(n) if n < planes && !plane_parameters.is_null() => unsafe {
+            plane_parameters.add(n as usize)
+        },
+        _ => plane_parameters,
+    };
+    #[cfg(windows)]
     if !sent_behind
         && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        && let Some(plane) = unsafe { selected_plane.as_ref() }
+        && let Some(resource) = plane.first()
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -1395,6 +1472,182 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Shows two planes composed: plane 0 written, plane 1 blended over it
+/// (see [`crate::compose`]), each from its source rectangle to its
+/// placement when the plane's are sensible, its whole texture over the
+/// whole screen otherwise. False if nothing was shown (a plane without a
+/// host texture, both the same, composition unavailable): the caller shows
+/// one plane.
+#[cfg(windows)]
+fn compose(planes: &[Plane; 2], frame: u64) -> bool {
+    use crate::compose::{LAYERS, Layer, sampled_format};
+    const SAMPLED: u32 = 0x80;
+    let mut found = [None; LAYERS];
+    for (slot, plane) in found.iter_mut().zip(planes) {
+        *slot = plane
+            .first()
+            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
+    }
+    let [Some((bottom, bottom_texture)), Some((top, top_texture))] = found else {
+        return false;
+    };
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    if bottom == top {
+        return false;
+    }
+    let resources = [bottom, top];
+    let textures = [bottom_texture, top_texture];
+    // SAFETY: live resources.
+    let descs = textures.map(|t| unsafe { t.GetDesc() });
+    if descs.iter().any(|d| {
+        d.Dimension != windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            || d.SampleDesc.Count != 1
+            || d.Flags.0
+                & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0
+                != 0
+    }) {
+        return false;
+    }
+    log_placements(planes, &descs);
+    let states = resources.map(|r| {
+        crate::resource::host_transition(r, SAMPLED).map_or(SAMPLED, |(_, before)| before)
+    });
+    let layers: Vec<Layer> = (0..LAYERS)
+        .map(|i| {
+            let d = &descs[i];
+            let (width, height) = (d.Width as u32, d.Height);
+            Layer {
+                texture: textures[i],
+                state: states[i],
+                format: sampled_format(
+                    crate::resource::view_format(resources[i]).unwrap_or(d.Format.0 as u32),
+                ),
+                source: planes[i]
+                    .source_rect()
+                    .and_then(|r| sensible_source(r, width, height))
+                    .unwrap_or([0, 0, width, height]),
+                destination: planes[i]
+                    .placement()
+                    .filter(|&p| sensible_placement(p))
+                    .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+            }
+        })
+        .collect();
+    let shown = host.compose(&layers, frame);
+    for (r, s) in resources.iter().zip(states) {
+        crate::resource::host_transition(*r, s);
+    }
+    #[cfg(feature = "diagnostics")]
+    if shown.is_some() {
+        blinks(frame, top, states[1], shown);
+    }
+    shown.is_some()
+}
+
+/// A source rectangle inside a `width` by `height` texture, not empty.
+#[cfg(windows)]
+fn sensible_source(
+    [left, top, right, bottom]: [i32; 4],
+    width: u32,
+    height: u32,
+) -> Option<[u32; 4]> {
+    let inside =
+        |low: i32, high: i32, size: u32| 0 <= low && low < high && high as i64 <= i64::from(size);
+    (inside(left, right, width) && inside(top, bottom, height)).then_some([
+        left as u32,
+        top as u32,
+        right as u32,
+        bottom as u32,
+    ])
+}
+
+/// A placement inside the screen, not empty.
+#[cfg(windows)]
+fn sensible_placement([left, top, right, bottom]: [f32; 4]) -> bool {
+    let inside = |low: f32, high: f32| (0.0..1.0).contains(&low) && low < high && high <= 1.0;
+    inside(left, right) && inside(top, bottom)
+}
+
+/// Logs the planes' sizes, formats and placements as read (before the
+/// sensibility checks) at the first composition and whenever they change.
+#[cfg(windows)]
+fn log_placements(
+    planes: &[Plane; 2],
+    descs: &[windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC; 2],
+) {
+    type Key = (
+        u64,
+        u32,
+        i32,
+        Option<[i32; 4]>,
+        Option<[u32; 4]>,
+        u32,
+        [u32; 7],
+    );
+    static LAST: std::sync::Mutex<[Option<Key>; 2]> = std::sync::Mutex::new([None, None]);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    for (index, (plane, d)) in planes.iter().zip(descs).enumerate() {
+        let source = plane.source_rect();
+        let placement = plane.placement();
+        let key = (
+            d.Width,
+            d.Height,
+            d.Format.0,
+            source,
+            placement.map(|p| p.map(f32::to_bits)),
+            plane.color_space,
+            plane.rest,
+        );
+        if last[index].as_ref() != Some(&key) {
+            tracing::info!(
+                index,
+                width = d.Width,
+                height = d.Height,
+                format = d.Format.0,
+                ?source,
+                ?placement,
+                color_space = plane.color_space,
+                rest = ?plane.rest,
+                "PresentX plane composed"
+            );
+            last[index] = Some(key);
+        }
+    }
+}
+
+/// Diagnostics for frames in `VICTORY_CAPTURE_FRAMES`: a plane record's raw
+/// bytes, its first resource's description, and the fields as decoded.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn log_plane(frame: u64, index: usize, plane: &Plane) {
+    // SAFETY: the record is 0x48 bytes of the title's.
+    let raw = unsafe { std::slice::from_raw_parts((plane as *const Plane).cast::<u8>(), 0x48) };
+    let raw: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let first = plane.first();
+    let desc = first
+        .and_then(crate::resource::host_resource)
+        // SAFETY: a live resource.
+        .map(|t| unsafe { t.GetDesc() })
+        .map(|d| (d.Width, d.Height, d.Format.0, d.Flags.0));
+    tracing::info!(
+        frame,
+        index,
+        token = plane.token,
+        count = plane.count,
+        ?first,
+        ?desc,
+        source_rects = ?plane.source_rects,
+        source = ?plane.source_rect(),
+        destination = ?plane.destination,
+        placement = ?plane.placement(),
+        color_space = plane.color_space,
+        rest = ?plane.rest,
+        raw,
+        "PresentX plane"
+    );
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -1653,5 +1906,26 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn plane_placements_outside_the_texture_or_screen_are_not_sensible() {
+        assert_eq!(
+            sensible_source([0, 0, 3840, 2160], 3840, 2160),
+            Some([0, 0, 3840, 2160])
+        );
+        assert_eq!(
+            sensible_source([0, 0, 1920, 1080], 3840, 2160),
+            Some([0, 0, 1920, 1080])
+        );
+        assert_eq!(sensible_source([0, 0, 3841, 2160], 3840, 2160), None);
+        assert_eq!(sensible_source([-1, 0, 100, 100], 3840, 2160), None);
+        assert_eq!(sensible_source([100, 0, 100, 100], 3840, 2160), None);
+        assert!(sensible_placement([0.0, 0.0, 1.0, 1.0]));
+        assert!(sensible_placement([0.25, 0.25, 0.75, 0.75]));
+        assert!(!sensible_placement([0.0, 0.0, 3840.0, 2160.0]));
+        assert!(!sensible_placement([0.0, 0.0, f32::NAN, 1.0]));
+        assert!(!sensible_placement([0.5, 0.0, 0.5, 1.0]));
     }
 }

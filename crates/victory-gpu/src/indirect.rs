@@ -216,6 +216,48 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 }
 "#;
 
+/// Compiles HLSL with DXC (`dxcompiler.dll` from the DLL search path) for
+/// `profile` (such as `cs_6_0`), from entry point `entry`.
+pub(crate) fn dxc_compile(
+    source: &str,
+    profile: windows::core::PCWSTR,
+    entry: windows::core::PCWSTR,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::Dxc::*;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::core::{Interface, w};
+    type Create = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *const windows::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows::core::HRESULT;
+    // SAFETY: loading the compiler and calling its documented entry point with
+    // out pointers of ours; the buffer and arguments outlive the calls.
+    unsafe {
+        let library = LoadLibraryW(w!("dxcompiler.dll"))?;
+        let create: Create = std::mem::transmute(
+            GetProcAddress(library, s!("DxcCreateInstance"))
+                .ok_or_else(windows::core::Error::from_thread)?,
+        );
+        let mut raw = std::ptr::null_mut();
+        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut raw).ok()?;
+        let compiler = IDxcCompiler3::from_raw(raw);
+        let buffer = DxcBuffer {
+            Ptr: source.as_ptr().cast(),
+            Size: source.len(),
+            Encoding: DXC_CP_UTF8.0,
+        };
+        let arguments = [w!("-T"), profile, w!("-E"), entry, w!("-O3")];
+        let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
+        result.GetStatus()?.ok()?;
+        let blob = result.GetResult()?;
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec(),
+        )
+    }
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
