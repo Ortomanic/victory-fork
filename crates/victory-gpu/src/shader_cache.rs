@@ -1,13 +1,13 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
+//! cache folder, keyed by the container's content and by what translated
+//! it (the translator's sources and its settings, [`build`]), so a changed
 //! translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! must be added to `encode` and `decode` too (this file is part of the
+//! key, so entries of an older encoding are ignored).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -37,56 +37,68 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+/// What a translation is made from besides the container: the
+/// translator's sources (`victory_shader::emit::SOURCE`, a hash of the
+/// crate, its manifest and the lock file), this file (which encodes the
+/// entries), and the settings it runs with
+/// (`victory_shader::emit::translation_settings`: its switches, the host's
+/// widest wave and view heap limit; read at each call, as the limit can
+/// change during a run).
+///
+/// Keyed on the whole executable before, so every rebuild, of any crate,
+/// translated all ~3,000 shaders a world needs again (~0.1 s of processor
+/// each; the five fxceless runs of 2026-11-24 found none cached), and so
+/// did every update of a tester's build. `VICTORY_SHADER_CACHE_EXE=1`:
+/// keyed on the executable, as before.
+fn build() -> [u8; 32] {
+    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let exe = EXE.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
+            tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner");
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(victory_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VICTORY_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VICTORY_WAVE_WIDE",
-                    "VICTORY_WAVE_DEEP_SKIPS",
-                    "VICTORY_WAVE_OWN_BITS",
-                    "VICTORY_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+        if std::env::var_os("VICTORY_SHADER_CACHE_EXE").is_none_or(|v| v != "1") {
+            tracing::info!(source = victory_shader::emit::SOURCE, "shader cache keyed on the translator's sources");
+            return None;
+        }
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                Some(*blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes())
             }
         }
-    })
+    });
+    key(exe.as_ref(), &victory_shader::emit::translation_settings())
+}
+
+/// Raised by hand when translations change without a change to the
+/// translator's sources or this file (e.g. a host-side input the key does
+/// not see yet): every entry is then translated again.
+const CACHE_VERSION: u32 = 1;
+
+/// The cache key of [`build`]: the executable's hash if keyed on it, else
+/// the translator's sources and this file; then the settings.
+fn key(exe: Option<&[u8; 32]>, settings: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&CACHE_VERSION.to_le_bytes());
+    // When unsure, miss: a build with diagnostics keeps its own entries.
+    h.update(&[u8::from(cfg!(feature = "diagnostics"))]);
+    match exe {
+        Some(exe) => {
+            h.update(b"exe");
+            h.update(exe);
+        }
+        None => {
+            h.update(b"source");
+            h.update(victory_shader::emit::SOURCE.as_bytes());
+            h.update(include_bytes!("shader_cache.rs"));
+        }
+    }
+    h.update(settings);
+    *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -94,7 +106,7 @@ fn build() -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }
@@ -328,6 +340,31 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key follows the translator and its settings, not the executable:
+    /// a rebuild of other crates keeps the translations.
+    #[test]
+    fn the_key_is_the_translators_not_the_executables() {
+        let settings = victory_shader::emit::translation_settings();
+        assert_eq!(victory_shader::emit::SOURCE.len(), 32);
+        assert_eq!(key(None, &settings), key(None, &settings));
+        assert_ne!(key(None, &settings), key(None, b"VICTORY_WAVE_WIDE=0"));
+        assert_ne!(key(None, &settings), key(Some(&[0; 32]), &settings));
+        assert_ne!(key(Some(&[0; 32]), &settings), key(Some(&[1; 32]), &settings));
+        // Without `VICTORY_SHADER_CACHE_EXE=1` the executable is not read.
+        if std::env::var_os("VICTORY_SHADER_CACHE_EXE").is_none() {
+            assert_eq!(build(), key(None, &settings));
+        }
+    }
+
+    /// Every switch the translator reads is part of the settings.
+    #[test]
+    fn the_settings_name_the_translators_switches() {
+        let settings = victory_shader::emit::translation_settings();
+        for name in ["VICTORY_WAVE_WIDE", "VICTORY_WAVE_OWN_BITS", "VICTORY_SHADER_OPT", "VICTORY_GROUP_SYNC"] {
+            assert!(settings.windows(name.len()).any(|w| w == name.as_bytes()), "{name}");
+        }
+    }
 
     fn shader() -> HostShader {
         HostShader {

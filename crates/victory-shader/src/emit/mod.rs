@@ -118,6 +118,48 @@ pub use shader::{
     set_view_heap_limit,
 };
 
+/// What the translation is made from: a hash of this crate's sources, its
+/// manifest and the workspace's lock file (`build.rs`). A cache of
+/// translations keys on it together with [`translation_settings`].
+pub const SOURCE: &str = env!("VICTORY_SHADER_SOURCE");
+
+/// Every setting of this process that changes a translation besides the
+/// container: the switches the translator reads (set or not) and what the
+/// host told it ([`set_host_max_wave`], [`set_view_heap_limit`]). Read at
+/// each call: the view heap limit can be set after the first translation.
+pub fn translation_settings() -> Vec<u8> {
+    let mut out = Vec::new();
+    for name in [
+        "VICTORY_DXIL",
+        "VICTORY_F16_NEAREST",
+        "VICTORY_GROUP_SYNC",
+        "VICTORY_MESH_OUTPUT_STRICT",
+        "VICTORY_SHADER_LOOP_LIMIT",
+        "VICTORY_SHADER_OPT",
+        "VICTORY_STRICT_JOINS",
+        "VICTORY_WARP",
+        "VICTORY_WAVE_DEEP_SKIPS",
+        "VICTORY_WAVE_LOCAL",
+        "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_WAVE_WIDE",
+    ] {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.push(group_sync());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    // Debugging switches of this crate.
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    out
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
