@@ -504,6 +504,35 @@ pub fn emit(
                 }
             }
         }
+        // Last resort, only when asked for (`VICTORY_WAVE_WIDE=last`): where no form above runs
+        // on this host (the program stops, or still needs 64-lane waves, which a 32-lane host
+        // refuses), the wave-wide branches after all, for a group of one console wave
+        // ([`widen`]). This is the same form as `VICTORY_WAVE_WIDE=1` (group barriers inside
+        // branches and loops, which lost the card in runs 121-124), so it is off by default
+        // too; `last` only keeps it away from programs another form takes (the particle
+        // light-atlas ones). The three FidelityFX upscaler programs that stop at "a lane mask
+        // exchanged where not every lane runs" (8b437ab6, 477b52e7, 17af85f1) get here and run
+        // in waves of 32 this way, with one branch taken wave-wide.
+        // shortcut: whether this holds on the card for those programs, and what it costs
+        // there, is untried.
+        let last_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last");
+        if last_on && !wide_on {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
