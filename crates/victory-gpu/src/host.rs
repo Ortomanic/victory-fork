@@ -199,6 +199,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    crate::pipeline::worker_stats();
     crate::pipeline::save_early_list_soon();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();

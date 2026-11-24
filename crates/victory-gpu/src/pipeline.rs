@@ -797,6 +797,13 @@ pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// The pipeline workers' line (where their time goes), at most every 5 s
+/// while they have work; called by the host's sweep.
+#[cfg(windows)]
+pub(crate) fn worker_stats() {
+    make::stats::tick();
+}
+
 /// Saves the early list soon if draws asked for new pipelines
 /// (`library::save_soon`); called by the host's sweep.
 #[cfg(windows)]
