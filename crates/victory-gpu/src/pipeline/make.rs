@@ -60,8 +60,26 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // Translated first, so that the two steps are timed apart
+            // ([`stats`]); `HostPipeline::new` finds them translated. Only
+            // the stages it translates, and only if it does.
+            let (wall, cpu) = (Instant::now(), stats::thread_cpu_us());
+            if self.shaders.iter().all(|s| matches!(s.stage, "vertex" | "pixel" | "mesh" | "compute")) {
+                for s in &self.shaders {
+                    let _ = s.translated();
+                }
+            }
+            let (translated, translated_cpu) = (wall.elapsed(), stats::thread_cpu_us());
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            stats::add(
+                translated,
+                translated_cpu.saturating_sub(cpu),
+                wall.elapsed() - translated,
+                stats::thread_cpu_us().saturating_sub(translated_cpu),
+            );
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -293,24 +311,50 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers make pipelines: `VICTORY_PIPELINE_WORKERS=<n>` (1 to
+/// 64), else half the logical processors, 2 to 8.
+fn worker_count() -> usize {
+    std::env::var("VICTORY_PIPELINE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=stats::MAX_WORKERS).contains(n))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
+}
+
+/// The workers' thread priority: `VICTORY_PIPELINE_PRIORITY=normal`, else
+/// below normal (below the title's own threads: loading, recording).
+fn worker_priority() -> (windows::Win32::System::Threading::THREAD_PRIORITY, &'static str) {
+    use windows::Win32::System::Threading::{THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+    match std::env::var("VICTORY_PIPELINE_PRIORITY").as_deref().map(str::trim) {
+        Ok("normal") => (THREAD_PRIORITY_NORMAL, "normal"),
+        _ => (THREAD_PRIORITY_BELOW_NORMAL, "below normal"),
+    }
+}
+
+/// Starts the workers ([`worker_count`], [`worker_priority`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
+        let (priority, named) = worker_priority();
+        stats::WORKERS.store(workers as u64, Ordering::Relaxed);
+        tracing::info!(workers, priority = named, "host pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                .spawn(move || {
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
-                        next().make();
+                        let p = next();
+                        stats::BUSY_SINCE[i].store(crate::host::now_ms().max(1), Ordering::Relaxed);
+                        p.make();
+                        stats::BUSY_SINCE[i].store(0, Ordering::Relaxed);
+                        drop(p);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -326,6 +370,84 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+/// Where the workers' time goes, logged every 5 s while they have work
+/// ([`tick`]): pipelines made, the wall and the thread's processor time
+/// translating their shaders (from the translated-shader cache or not) and
+/// creating the host pipeline, the longest create, and the longest a
+/// worker has been on one pipeline. A wall time far over the processor
+/// time is a worker that waits (for the processor, a lock, or a shader
+/// another worker translates).
+pub(crate) mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    pub(crate) const MAX_WORKERS: usize = 64;
+    pub(crate) static WORKERS: AtomicU64 = AtomicU64::new(0);
+    /// When each worker took its pipeline (`crate::host::now_ms`), 0: idle.
+    pub(crate) static BUSY_SINCE: [AtomicU64; MAX_WORKERS] = [const { AtomicU64::new(0) }; MAX_WORKERS];
+    /// Made, translate wall and CPU, create wall and CPU (µs), longest create (µs).
+    static SUMS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+    /// This thread's processor time so far (user and kernel), in µs.
+    pub(crate) fn thread_cpu_us() -> u64 {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+        let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+        // SAFETY: four FILETIMEs of ours.
+        let [created, exited, kernel, user] = &mut t;
+        if unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) } == 0 {
+            return 0;
+        }
+        let ticks = |f: &FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+        (ticks(kernel) + ticks(user)) / 10
+    }
+
+    pub(crate) fn add(translate: Duration, translate_cpu: u64, create: Duration, create_cpu: u64) {
+        let create_us = create.as_micros() as u64;
+        for (i, v) in [1, translate.as_micros() as u64, translate_cpu, create_us, create_cpu].into_iter().enumerate() {
+            SUMS[i].fetch_add(v, Ordering::Relaxed);
+        }
+        SUMS[5].fetch_max(create_us, Ordering::Relaxed);
+    }
+
+    /// The stats line, at most every 5 s, while pipelines are waiting or
+    /// were made since the last one. Called by the host's sweep.
+    pub(crate) fn tick() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let waiting = super::waiting();
+        if waiting == 0 && SUMS[0].load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let [made, tw, tc, cw, cc, longest] = std::array::from_fn(|i| SUMS[i].swap(0, Ordering::Relaxed));
+        let workers = (WORKERS.load(Ordering::Relaxed) as usize).min(MAX_WORKERS);
+        let busy: Vec<u64> = BUSY_SINCE[..workers]
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .filter(|&b| b != 0)
+            .map(|b| now.saturating_sub(b))
+            .collect();
+        let s = |us: u64| us as f64 / 1e6;
+        tracing::info!(
+            "host pipeline workers: {made} made in {:.1} s, {waiting} waiting; translating {:.1} s ({:.1} s of processor), \
+             creating {:.1} s ({:.1} s of processor), longest create {:.0} ms; {} of {workers} busy, the longest on one \
+             pipeline for {:.1} s",
+            now.saturating_sub(last) as f64 / 1e3,
+            s(tw),
+            s(tc),
+            s(cw),
+            s(cc),
+            longest as f64 / 1e3,
+            busy.len(),
+            busy.iter().max().copied().unwrap_or(0) as f64 / 1e3,
+        );
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
