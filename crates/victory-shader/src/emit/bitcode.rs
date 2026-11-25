@@ -1410,4 +1410,73 @@ mod tests {
         assert_eq!(m.blocks.len(), latch + 1);
         let _ = m.write();
     }
+
+    /// A block that continues two loops (an inner and an outer header)
+    /// keeps one back edge; the other goes through a block of its own, and
+    /// the phis of that loop's header name the new block.
+    #[test]
+    fn a_block_continuing_two_loops_keeps_one_back_edge() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (entry, outer, inner, both, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        let (zero, one) = (m.i32(0), m.i32(1));
+        let c = m.bool(true);
+        m.terminate(entry, Term::Br(outer));
+        let po = m.phi(outer, i32t);
+        m.terminate(outer, Term::Br(inner));
+        let pi = m.phi(inner, i32t);
+        m.terminate(inner, Term::CondBr(c, both, exit));
+        let v = m.bin(both, Bin::Add, pi, one);
+        m.terminate(both, Term::CondBr(c, inner, outer));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(po, vec![(zero, entry), (v, both)]);
+        m.set_phi(pi, vec![(po, outer), (v, both)]);
+        m.single_latches();
+
+        // One new block, which only branches back to one of the headers.
+        let via = exit + 1;
+        assert_eq!(m.blocks.len(), via + 1);
+        let Some(Term::Br(moved)) = m.blocks[via].term else {
+            panic!("the new block branches back")
+        };
+        assert!(moved == inner || moved == outer);
+        let kept = if moved == inner { outer } else { inner };
+        let Some(Term::CondBr(_, t, f)) = m.blocks[both].term else {
+            panic!("still a conditional branch")
+        };
+        let mut targets = [t, f];
+        targets.sort_unstable();
+        let mut expected = [kept, via];
+        expected.sort_unstable();
+        assert_eq!(targets, expected);
+        // No block has a back edge to two headers any more.
+        let back = m.back_edges();
+        assert_eq!(back.len(), 2);
+        for (h, from) in &back {
+            assert_eq!(from[..], [if *h == moved { via } else { both }]);
+        }
+        // The moved loop's header takes its value from the new block; the
+        // other header's phi is as it was.
+        let incoming = |phi: V| {
+            let V::Inst(p) = phi else { panic!() };
+            let Op::Phi(inc) = &m.insts[p as usize].op else {
+                panic!("a phi")
+            };
+            inc.clone()
+        };
+        let (moved_phi, kept_phi) = if moved == inner { (pi, po) } else { (po, pi) };
+        assert!(incoming(moved_phi).contains(&(v, via)));
+        assert!(!incoming(moved_phi).iter().any(|&(_, b)| b == both));
+        assert!(incoming(kept_phi).contains(&(v, both)));
+        // Done again: nothing to do.
+        m.single_latches();
+        assert_eq!(m.blocks.len(), via + 1);
+        let _ = m.write();
+    }
 }
