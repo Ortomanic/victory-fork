@@ -588,7 +588,7 @@ pub(crate) fn save(now: bool) {
         return;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
-    // The bytes of the library written to `tmp`; 0 when no pipeline was
+    // The bytes of the library written to `tmp`; None when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
@@ -597,11 +597,8 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
-        }
         if added == 0 {
-            0
+            None
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -613,14 +610,19 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            Some(size)
         }
-    } else if USED_CHANGED.swap(false, Ordering::Relaxed) {
-        0
     } else {
-        return;
+        None
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used: Vec<String> = {
+        let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && bytes.is_none() {
+            return;
+        }
+        used.iter().flatten().cloned().collect()
+    };
+    let bytes = bytes.unwrap_or(0);
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -647,7 +649,10 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -769,12 +774,14 @@ mod tests {
     fn the_early_list_is_saved_with_or_without_a_library() {
         let dir = tempfile::tempdir().unwrap();
         use_pipeline_cache(dir.path().to_owned());
-        if DIR.get().map(PathBuf::as_path) != Some(dir.path()) {
-            return; // another test chose the folder first
-        }
+        assert_eq!(DIR.get().map(PathBuf::as_path), Some(dir.path()));
+        let path = dir.path().join(EARLY_FILE);
+        std::fs::create_dir(&path).unwrap();
         note_used("early-list-test");
         save(true);
-        let listed = std::fs::read_to_string(dir.path().join(EARLY_FILE)).expect("the early list");
+        std::fs::remove_dir(&path).expect("the obstruction remains after the failed save");
+        save(true);
+        let listed = std::fs::read_to_string(&path).expect("the early list after retry");
         assert!(listed.lines().any(|l| l == "early-list-test"), "{listed}");
     }
 
