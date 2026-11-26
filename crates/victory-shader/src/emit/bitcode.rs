@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
@@ -500,6 +500,131 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Each loop header with the blocks that branch back to it: edges to
+    /// a block still on the depth-first stack from the entry (block 0), in
+    /// a reducible graph whatever the order.
+    fn back_edges(&self) -> Vec<(usize, Vec<usize>)> {
+        let succs = |blocks: &[Block], b: usize| match blocks[b].term {
+            Some(Term::Br(t)) => vec![t],
+            Some(Term::CondBr(_, t, f)) => vec![t, f],
+            _ => vec![],
+        };
+        let n = self.blocks.len();
+        let mut seen = vec![false; n];
+        let mut on_stack = vec![false; n];
+        let mut back: Vec<(usize, Vec<usize>)> = Vec::new();
+        if n == 0 {
+            return back;
+        }
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        on_stack[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(&self.blocks, b).get(k) {
+                Some(&s) if on_stack[s] => match back.iter_mut().find(|(h, _)| *h == s) {
+                    Some((_, from)) if !from.contains(&b) => from.push(b),
+                    Some(_) => {}
+                    None => back.push((s, vec![b])),
+                },
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    on_stack[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    on_stack[b] = false;
+                    stack.pop();
+                }
+            }
+        }
+        back
+    }
+
+    /// Gives every loop one back edge: a header that more than one block
+    /// branches back to (the console's loops can continue from several
+    /// places) gets a latch block of its own that those branches go to
+    /// instead, with phis joining what each brings to the header's phis.
+    /// DXC's loops have one latch, and vkd3d-proton's DXIL-to-SPIR-V
+    /// structuriser asserts on a header with two back edges
+    /// (`cfg_structurizer.cpp`: "succ->pred_back_edge == &entry"); the
+    /// Abort/Retry/Ignore dialog it raises stops the pipeline compile.
+    /// Block 0 is the entry. Call it after every phi is filled in.
+    pub fn single_latches(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        // A block may continue two loops (an inner and an outer header):
+        // dxil-spirv allows one back edge out of a block too
+        // (`cfg_structurizer.cpp`: "entry.succ_back_edge == succ"). All
+        // but its first go through a block of their own that only branches
+        // back.
+        for (header, from) in self.back_edges() {
+            for b in from {
+                let backs = self
+                    .back_edges()
+                    .iter()
+                    .filter(|(_, f)| f.contains(&b))
+                    .map(|(h, _)| *h)
+                    .collect::<Vec<_>>();
+                if backs.len() < 2 || backs[0] == header {
+                    continue;
+                }
+                let via = self.new_block();
+                self.blocks[via].term = Some(Term::Br(header));
+                let to = |t: usize| if t == header { via } else { t };
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    t => t,
+                };
+                for phi in self.blocks[header].phis.clone() {
+                    let Op::Phi(incoming) = &self.insts[phi as usize].op else {
+                        unreachable!("a phi")
+                    };
+                    let incoming = incoming
+                        .iter()
+                        .map(|&(v, p)| (v, if p == b { via } else { p }))
+                        .collect();
+                    self.set_phi(V::Inst(phi), incoming);
+                }
+            }
+        }
+        let back = self.back_edges();
+        for (header, from) in back {
+            if from.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for phi in self.blocks[header].phis.clone() {
+                let Op::Phi(incoming) = &self.insts[phi as usize].op else {
+                    unreachable!("a phi")
+                };
+                let (looped, entering): (Vec<_>, Vec<_>) = incoming
+                    .iter()
+                    .copied()
+                    .partition(|(_, b)| from.contains(b));
+                let ty = self.insts[phi as usize].ty;
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, looped);
+                let mut incoming = entering;
+                incoming.push((joined, latch));
+                self.set_phi(V::Inst(phi), incoming);
+            }
+            let to = |t: usize| if t == header { latch } else { t };
+            for &b in &from {
+                self.blocks[b].term = match self.blocks[b].term {
+                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
+                    t => t,
+                };
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -548,85 +673,6 @@ impl Module {
         }
         live
     }
-
-    /// The blocks a block's terminator branches to.
-    fn successors(&self, b: usize) -> Vec<usize> {
-        match self.blocks[b].term {
-            Some(Term::Br(t)) => vec![t],
-            Some(Term::CondBr(_, t, f)) => vec![t, f],
-            _ => Vec::new(),
-        }
-    }
-
-    /// Gives every loop header one back edge, as DXC's code has:
-    /// vkd3d-proton's DXIL conversion keeps one per header, takes any other
-    /// for a forward edge and then recurses without end over the cycle that
-    /// makes (in programs with wave shuffles). The back edges of a header
-    /// with several go through a new block that joins their phi values.
-    pub fn single_latches(&mut self) {
-        let n = self.blocks.len();
-        if n == 0 {
-            return;
-        }
-        // Depth-first from the entry: an edge to a block still on the stack
-        // is a back edge (the control flow is reducible).
-        let mut state = vec![0u8; n];
-        let mut stack = vec![(0usize, 0usize)];
-        state[0] = 1;
-        let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            let succ = self.successors(b);
-            if k < succ.len() {
-                top.1 += 1;
-                let t = succ[k];
-                match state[t] {
-                    0 => {
-                        state[t] = 1;
-                        stack.push((t, 0));
-                    }
-                    1 => latches.entry(t).or_default().push(b),
-                    _ => {}
-                }
-            } else {
-                state[b] = 2;
-                stack.pop();
-            }
-        }
-        for (header, mut from) in latches {
-            from.sort_unstable();
-            from.dedup();
-            if from.len() < 2 {
-                continue;
-            }
-            let latch = self.new_block();
-            for &b in &from {
-                let to = |t: usize| if t == header { latch } else { t };
-                self.blocks[b].term = match self.blocks[b].term {
-                    Some(Term::Br(t)) => Some(Term::Br(to(t))),
-                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, to(t), to(f))),
-                    other => other,
-                };
-            }
-            self.blocks[latch].term = Some(Term::Br(header));
-            for id in self.blocks[header].phis.clone() {
-                let Op::Phi(incoming) = self.insts[id as usize].op.clone() else {
-                    continue;
-                };
-                let ty = self.insts[id as usize].ty;
-                let (back, mut rest): (Vec<_>, Vec<_>) =
-                    incoming.into_iter().partition(|(_, b)| from.contains(b));
-                if back.is_empty() {
-                    continue;
-                }
-                let joined = self.phi(latch, ty);
-                self.set_phi(joined, back);
-                rest.push((joined, latch));
-                self.insts[id as usize].op = Op::Phi(rest);
-            }
-        }
-    }
-
 
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
@@ -810,6 +856,10 @@ impl Module {
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
+                // Not into a block that already branches back (to an outer
+                // loop's header): one block with two back edges asserts in
+                // dxil-spirv ("entry.succ_back_edge == succ").
+                && !succs(*p).iter().any(|&s| s != b && pos[s] <= pos[*p])
             {
                 fold[b] = Some((*p, h));
             }
@@ -1356,44 +1406,116 @@ mod tests {
         }
     }
 
-    /// A loop header with two back edges gets one, through a new block that
-    /// joins what each brings (vkd3d-proton keeps one per header).
+    /// A loop continued from two blocks gets one latch; a loop with one
+    /// back edge is left alone.
     #[test]
-    fn a_header_with_two_back_edges_gets_one() {
+    fn single_latches() {
         let mut m = Module::default();
         let i32t = m.int(32);
-        let void = m.void();
-        let main_ty = m.func_ty(void, vec![]);
-        m.function("main", main_ty, None, true);
-        let [entry, head, body, mid, exit] = [(); 5].map(|()| m.new_block());
+        let (entry, header, a, b, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
         let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
-        m.terminate(entry, Term::Br(head));
-        let p = m.phi(head, i32t);
-        m.terminate(head, Term::Br(body));
-        let x = m.bin(body, Bin::Add, p, one);
-        let c = m.cmp(body, pred::IULT, x, two);
-        m.terminate(body, Term::CondBr(c, head, mid));
-        let y = m.bin(mid, Bin::Add, x, one);
-        let d = m.cmp(mid, pred::IULT, y, two);
-        m.terminate(mid, Term::CondBr(d, head, exit));
+        let c = m.bool(true);
+        m.terminate(entry, Term::Br(header));
+        let phi = m.phi(header, i32t);
+        m.terminate(header, Term::CondBr(c, a, b));
+        let va = m.bin(a, Bin::Add, phi, one);
+        m.terminate(a, Term::CondBr(c, header, b));
+        let vb = m.bin(b, Bin::Add, phi, two);
+        m.terminate(b, Term::CondBr(c, exit, header));
         m.terminate(exit, Term::Ret);
-        m.set_phi(p, vec![(zero, entry), (x, body), (y, mid)]);
+        m.set_phi(phi, vec![(zero, entry), (va, a), (vb, b)]);
         m.single_latches();
-        let latch = m.blocks.len() - 1;
-        assert_eq!(m.successors(body), [latch, mid]);
-        assert_eq!(m.successors(mid), [latch, exit]);
-        assert_eq!(m.successors(latch), [head]);
-        let phi = |m: &Module, v: V| match v {
-            V::Inst(id) => match &m.insts[id as usize].op {
-                Op::Phi(incoming) => incoming.clone(),
-                op => panic!("{op:?}"),
-            },
-            v => panic!("{v:?}"),
+
+        let latch = exit + 1;
+        assert_eq!(m.blocks.len(), latch + 1);
+        assert!(matches!(m.blocks[a].term, Some(Term::CondBr(_, l, t)) if l == latch && t == b));
+        assert!(matches!(m.blocks[b].term, Some(Term::CondBr(_, e, l)) if e == exit && l == latch));
+        assert!(matches!(m.blocks[latch].term, Some(Term::Br(h)) if h == header));
+        let joined = V::Inst(m.blocks[latch].phis[0]);
+        let V::Inst(p) = phi else { panic!() };
+        assert!(
+            matches!(&m.insts[p as usize].op, Op::Phi(inc) if inc[..] == [(zero, entry), (joined, latch)])
+        );
+        let V::Inst(j) = joined else { panic!() };
+        assert!(matches!(&m.insts[j as usize].op, Op::Phi(inc) if inc[..] == [(va, a), (vb, b)]));
+        // Done again: one back edge now, nothing to do.
+        m.single_latches();
+        assert_eq!(m.blocks.len(), latch + 1);
+        let _ = m.write();
+    }
+
+    /// A block that continues two loops (an inner and an outer header)
+    /// keeps one back edge; the other goes through a block of its own, and
+    /// the phis of that loop's header name the new block.
+    #[test]
+    fn a_block_continuing_two_loops_keeps_one_back_edge() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (entry, outer, inner, both, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        let (zero, one) = (m.i32(0), m.i32(1));
+        let c = m.bool(true);
+        m.terminate(entry, Term::Br(outer));
+        let po = m.phi(outer, i32t);
+        m.terminate(outer, Term::Br(inner));
+        let pi = m.phi(inner, i32t);
+        m.terminate(inner, Term::CondBr(c, both, exit));
+        let v = m.bin(both, Bin::Add, pi, one);
+        m.terminate(both, Term::CondBr(c, inner, outer));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(po, vec![(zero, entry), (v, both)]);
+        m.set_phi(pi, vec![(po, outer), (v, both)]);
+        m.single_latches();
+
+        // One new block, which only branches back to one of the headers.
+        let via = exit + 1;
+        assert_eq!(m.blocks.len(), via + 1);
+        let Some(Term::Br(moved)) = m.blocks[via].term else {
+            panic!("the new block branches back")
         };
-        let incoming = phi(&m, p);
-        assert_eq!(incoming[0], (zero, entry));
-        assert_eq!(incoming[1].1, latch);
-        assert_eq!(phi(&m, incoming[1].0), [(x, body), (y, mid)]);
-        assert!(!m.write().is_empty());
+        assert!(moved == inner || moved == outer);
+        let kept = if moved == inner { outer } else { inner };
+        let Some(Term::CondBr(_, t, f)) = m.blocks[both].term else {
+            panic!("still a conditional branch")
+        };
+        let mut targets = [t, f];
+        targets.sort_unstable();
+        let mut expected = [kept, via];
+        expected.sort_unstable();
+        assert_eq!(targets, expected);
+        // No block has a back edge to two headers any more.
+        let back = m.back_edges();
+        assert_eq!(back.len(), 2);
+        for (h, from) in &back {
+            assert_eq!(from[..], [if *h == moved { via } else { both }]);
+        }
+        // The moved loop's header takes its value from the new block; the
+        // other header's phi is as it was.
+        let incoming = |phi: V| {
+            let V::Inst(p) = phi else { panic!() };
+            let Op::Phi(inc) = &m.insts[p as usize].op else {
+                panic!("a phi")
+            };
+            inc.clone()
+        };
+        let (moved_phi, kept_phi) = if moved == inner { (pi, po) } else { (po, pi) };
+        assert!(incoming(moved_phi).contains(&(v, via)));
+        assert!(!incoming(moved_phi).iter().any(|&(_, b)| b == both));
+        assert!(incoming(kept_phi).contains(&(v, both)));
+        // Done again: nothing to do.
+        m.single_latches();
+        assert_eq!(m.blocks.len(), via + 1);
+        let _ = m.write();
     }
 }
