@@ -6,6 +6,24 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
+static TRIM_IDLE: AtomicBool = AtomicBool::new(false);
+
+/// Legacy opt-in threshold for releasing spare storage sooner. The stock
+/// pressure policy still protects allocations and controls upload admission.
+pub(crate) fn trim_idle() -> bool {
+    TRIM_IDLE.load(Ordering::Relaxed)
+}
+
+fn trim_threshold() -> Option<u64> {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_RAM_TRIM_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&mb| mb != 0)
+            .and_then(|mb| mb.checked_mul(MIB))
+    })
+}
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn memory_status() -> Option<MEMORYSTATUSEX> {
@@ -95,6 +113,14 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+/// Whether idle memory is trimmed: from when free physical memory falls
+/// under `limit` until it is back above `limit` by an eighth of it (512 MiB
+/// at least), so that storage freed at the line is not made again and freed
+/// again every second.
+fn next_trim(was: bool, physical: u64, limit: u64) -> bool {
+    if was { physical < limit.saturating_add((limit / 8).max(512 * MIB)) } else { physical < limit }
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -108,6 +134,8 @@ pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    let trimming = TRIM_IDLE.load(Ordering::Relaxed);
+    TRIM_IDLE.store(trim_threshold().is_some_and(|limit| next_trim(trimming, physical, limit)), Ordering::Relaxed);
     let was = pressured();
     let pressure = next_pressure(was, physical, commit);
     if pressure != was {
@@ -175,6 +203,20 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false), growth);
         }
+    }
+
+    #[test]
+    fn trimming_starts_under_the_limit_and_stops_well_above_it() {
+        let limit = 12 * GIB;
+        assert!(!next_trim(false, 12 * GIB, limit));
+        assert!(next_trim(false, 12 * GIB - 1, limit));
+        // An eighth of 12 GiB is 1.5 GiB.
+        assert!(next_trim(true, 13 * GIB, limit));
+        assert!(next_trim(true, 13 * GIB + 512 * MIB - 1, limit));
+        assert!(!next_trim(true, 13 * GIB + 512 * MIB, limit));
+        // The margin is 512 MiB at least.
+        assert!(next_trim(true, 2 * GIB + 511 * MIB, 2 * GIB));
+        assert!(!next_trim(true, 2 * GIB + 512 * MIB, 2 * GIB));
     }
 
     #[test]

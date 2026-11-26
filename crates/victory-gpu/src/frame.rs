@@ -208,6 +208,8 @@ pub(crate) extern "system" fn wait(
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
         }
+        #[cfg(windows)]
+        crate::census::frame(frame);
     }
     #[cfg(feature = "diagnostics")]
     tracing::debug!(

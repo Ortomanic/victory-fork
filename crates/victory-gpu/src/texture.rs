@@ -507,6 +507,36 @@ pub(crate) fn let_go() -> [u64; 2] {
     [LET_GO[0].load(Relaxed), LET_GO[1].load(Relaxed)]
 }
 
+/// Optional dimension limit for title-memory uploads into tiled textures.
+pub(crate) fn max_dim() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX_DIM")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|&value| value != 0)
+            .map(|value| value.max(64))
+    })
+}
+
+fn capped_first_mip(width: u32, height: u32, levels: usize, cap: u32) -> usize {
+    let largest = width.max(height);
+    (0..levels.min(32))
+        .find(|&level| (largest >> level).max(1) <= cap)
+        .unwrap_or_else(|| levels.saturating_sub(1))
+}
+
+#[cfg(test)]
+#[test]
+fn texture_cap_keeps_the_coarsest_mip() {
+    assert_eq!(capped_first_mip(4096, 4096, 13, 1024), 2);
+    assert_eq!(capped_first_mip(1024, 2048, 12, 1024), 1);
+    assert_eq!(capped_first_mip(1024, 512, 11, 1024), 0);
+    assert_eq!(capped_first_mip(4096, 4096, 3, 64), 2);
+    assert_eq!(capped_first_mip(4096, 4096, 1, 64), 0);
+    assert_eq!(capped_first_mip(4096, 4096, 0, 64), 0);
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -1180,6 +1210,9 @@ impl Staging {
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
+        let first = max_dim().map_or(first, |cap| {
+            first.max(capped_first_mip(self.layout.desc.width, self.layout.desc.height, mips.len(), cap) as u64)
+        });
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)

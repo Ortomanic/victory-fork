@@ -32,6 +32,28 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// The name this fork shows in the running title's caption and the overlay.
+pub(crate) const FORK_LABEL: &str = "adel";
+/// The upstream name this fork replaces in the title's own caption.
+const UPSTREAM_LABEL: &str = "soldsawn";
+
+/// The title's own window caption is where the runner shows which fork is
+/// running the game. Replace the upstream name with ours, whatever case it
+/// used, without touching the rest of the title's text.
+fn rebrand_caption(caption: &str) -> String {
+    let lower = caption.to_ascii_lowercase();
+    let mut out = String::with_capacity(caption.len());
+    let mut at = 0;
+    while let Some(rel) = lower[at..].find(UPSTREAM_LABEL) {
+        let start = at + rel;
+        out.push_str(&caption[at..start]);
+        out.push_str(FORK_LABEL);
+        at = start + UPSTREAM_LABEL.len();
+    }
+    out.push_str(&caption[at..]);
+    out
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -164,6 +186,17 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     } else {
         (SHORT_MS, used - share(85))
     }
+}
+
+/// An explicit timeout applies to both policies used by the texture sweep.
+pub(crate) fn vram_idle_override() -> Option<u64> {
+    static OVERRIDE: OnceLock<Option<u64>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_IDLE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|ms| ms.max(1_000))
+    })
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -372,6 +405,9 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    if crate::residency::trim_idle() {
+        return 2_000;
+    }
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -431,7 +467,8 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    let cadence = if crate::residency::trim_idle() { 500 } else { 1_000 };
+    if now < last + cadence
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -441,8 +478,13 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    if crate::residency::pressured() || crate::residency::trim_idle() {
         trim_spare_chunks();
+    }
+    if crate::residency::trim_idle() {
+        crate::list::trim_idle();
+        crate::shadow::trim_snapshots();
+        crate::shadow::trim_view_copies();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -1021,6 +1063,15 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_caption_uses_our_fork_name() {
+        assert_eq!(super::rebrand_caption("soldsawn 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("Soldsawn 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("SOLDSAWN 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("another fork"), "another fork");
+        assert_eq!(super::rebrand_caption(""), "");
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1858,6 +1909,17 @@ const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
+/// A lower limit for either of those: `VICTORY_SCRATCH_SPARE_MB`.
+fn scratch_spare_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(u64::MAX, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
 /// is reset or dropped, for the next list. Before, a list kept every chunk
@@ -1941,7 +2003,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                     SPARE_KEPT
                 } else {
                     SPARE_MOST
-                };
+                }
+                .min(scratch_spare_cap());
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -8966,6 +9029,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        crate::overlay::set_frame(fps, ms, draws);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -9197,10 +9261,11 @@ impl Meter {
             // SAFETY: a window handle and a buffer of that length.
             let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
             buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
+            let caption = String::from_utf16_lossy(&buffer);
+            self.caption = Some(rebrand_caption(&caption).encode_utf16().collect());
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | {FORK_LABEL} VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9559,6 +9624,7 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
+            crate::overlay::start(hwnd, self.adapter.clone());
             Ok(Presenter {
                 swap_chain,
                 width,

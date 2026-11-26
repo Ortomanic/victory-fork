@@ -20,6 +20,8 @@ mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -39,6 +41,10 @@ pub mod frame;
 mod book;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
+mod pixels;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]

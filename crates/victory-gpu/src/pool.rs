@@ -42,7 +42,9 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    let pressure = crate::residency::pressured();
+    // Trimming idle memory (`VICTORY_RAM_TRIM_MB`) keeps as few empty blocks
+    // as memory pressure does.
+    let pressure = crate::residency::pressured() || crate::residency::trim_idle();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
@@ -61,6 +63,32 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+}
+
+/// Empty blocks of textures kept at most: `VICTORY_TEXTURE_POOL_SPARE_MB`
+/// (in 64 MiB blocks, rounded down), else [`SPARE_KEPT`].
+fn texture_spare_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| blocks_for(std::env::var("VICTORY_TEXTURE_POOL_SPARE_MB").ok().as_deref()))
+}
+
+/// Empty blocks of staging buffers kept at most: `VICTORY_STAGING_POOL_MB`
+/// (in 64 MiB blocks, rounded down), else [`STAGING_KEPT`].
+fn staging_spare_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| blocks_for(std::env::var("VICTORY_STAGING_POOL_MB").ok().as_deref()))
+}
+
+/// Blocks for a setting in MiB; no cap without one.
+fn blocks_for(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(usize::MAX, |mb| usize::try_from(mb.saturating_mul(1 << 20) / BLOCK).unwrap_or(usize::MAX))
+}
+
+#[cfg(test)]
+fn no_cap() -> usize {
+    usize::MAX
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -198,12 +226,19 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// A lower `most` a setting may give.
+    cap: fn() -> usize,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
+    #[cfg(test)]
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool::capped(most, no_cap)
+    }
+
+    const fn capped(most: usize, cap: fn() -> usize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, cap, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -320,7 +355,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = limit.min(self.most);
+        let most = limit.min(self.most).min((self.cap)());
         let previous = std::mem::replace(&mut self.spare, most);
         if sweep || any || most < previous {
             let mut spare = 0;
@@ -346,8 +381,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::capped(SPARE_KEPT, texture_spare_cap));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::capped(STAGING_KEPT, staging_spare_cap));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -362,8 +397,8 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
-/// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
+/// For the memory line and the census: blocks of textures and of staging
+/// buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
@@ -582,6 +617,35 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_caps_come_in_whole_blocks() {
+        assert_eq!(blocks_for(None), usize::MAX);
+        assert_eq!(blocks_for(Some("x")), usize::MAX);
+        assert_eq!(blocks_for(Some("0")), 0);
+        assert_eq!(blocks_for(Some("63")), 0);
+        assert_eq!(blocks_for(Some("64")), 1);
+        assert_eq!(blocks_for(Some(" 256 ")), 4);
+    }
+
+    #[test]
+    fn a_capped_pool_keeps_no_more_empty_blocks_than_its_cap() {
+        fn one() -> usize {
+            1
+        }
+        let mut pool: Pool<u32> = Pool::capped(8, one);
+        let pieces: Vec<Piece> = (0..3).map(|i| pool.take(BLOCK / 2, 256, 0, || Some(i)).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 2);
+        let more = pool.take(BLOCK / 2, 256, 0, || Some(9)).unwrap().0;
+        assert_eq!(pool.blocks(), 2);
+        let last = pool.take(BLOCK / 2, 256, 0, || Some(10)).unwrap().0;
+        assert_eq!(pool.blocks(), 3);
+        for piece in pieces.into_iter().chain([more, last]) {
+            pool.give(piece, 0);
+        }
+        pool.reclaim(REST, 8, true);
+        assert_eq!(pool.blocks(), 1);
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

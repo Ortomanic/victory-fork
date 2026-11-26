@@ -54,16 +54,36 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
+    // Apply the optional cap to the prepared file before mapping it. A
+    // separate image directory keeps different caps from sharing a DLL.
     let images = cfg.cache_subdir("images")?;
+    let mut main_images = images.clone();
+    let resolution = std::env::var("VICTORY_RESOLUTION").ok().and_then(|text| {
+        let (w, h) = text.split_once(['x', 'X'])?;
+        let width = w.trim().parse::<u32>().ok()?;
+        let height = h.trim().parse::<u32>().ok()?;
+        (width > 0 && height > 0).then_some((width, height))
+    });
+    if let Some((width, height)) = resolution {
+        let changed = victory_game::output::cap_ladder(&mut prepared.bytes, width, height);
+        println!("resolution     {changed} ladder entry(ies) capped to {width}x{height}");
+        if changed > 0 {
+            main_images = images.join(format!("{width}x{height}"));
+            if let Some(at) = victory_game::output::assert_site(&prepared.bytes) {
+                prepared.bytes[at] = 0x90;
+                println!("resolution     int3 at file offset {at:#x} patched to nop");
+            }
+        }
+    }
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let image = victory_loader::load(&prepared, &main_images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in

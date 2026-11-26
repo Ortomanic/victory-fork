@@ -294,6 +294,22 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// Releases excess reset lists while retaining a warm pool.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    const KEEP: usize = 16;
+    let freed = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= KEEP {
+            return;
+        }
+        let freed = idle.0.split_off(KEEP);
+        idle.1 -= freed.iter().map(|entry| entry.1).sum::<u64>();
+        freed
+    };
+    drop(freed);
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
