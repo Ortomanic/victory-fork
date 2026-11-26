@@ -67,8 +67,8 @@ card to itself, and none is longer than six minutes.
 here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
 `VICTORY_TEXTURE_MAX_DIM=1024` (ad3lre's cap).
 
-**Warm the caches first.** `victory.exe shaders <game exe>` translates every shader (about two minutes here);
-after one played session, `victory.exe warm-used <game exe>` makes the pipelines that session drew (3,187 in
+**Warm the caches first.** `victory.exe shaders <game folder>\shaders.rpf` translates every shader (about two minutes here);
+after one played session, `victory.exe warm --used` makes the pipelines that session drew (3,187 in
 three and a half minutes here). Without them passes are missing until their pipelines are made: on a first
 start with rays on the water was not drawn at all.
 
@@ -79,7 +79,7 @@ every map and unmap (Wine bug 60868); with a tree lookup the frame went from abo
 ## Known problems
 
 - With rays on, every start spends its first one to two minutes in the world at about 3 fps while some 400
-  pipelines are made, also after `warm-used`; then it settles. Under vkd3d-proton the host pipeline library is
+  pipelines are made, also after `warm --used`; then it settles. Under vkd3d-proton the host pipeline library is
   refused ("no host pipeline library: pipelines are not kept"), which may be why; not looked into yet.
 - Three compute programs never get a host pipeline with rays on and their dispatches are dropped
   (`02384a60fda6f2d0`, `5dc3b25986622949`, `6f225b641c5b0708`); nothing is visibly missing.
