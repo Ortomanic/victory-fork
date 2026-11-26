@@ -415,6 +415,16 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let made = Self::create(shaders, g);
+        if made.is_some() {
+            // (Neptune-VE) `VICTORY_DROP_DXIL=1`: the code was read to make the
+            // pipeline; the next pipeline of these shaders reads it back.
+            shaders.iter().for_each(|s| s.release_dxil());
+        }
+        made
+    }
+
+    fn create(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -599,14 +609,14 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Held until the pipeline is made: the descriptions point into them
+        // (`VICTORY_DROP_DXIL=1` may let the shaders' own go meanwhile).
+        let dxils: Vec<Arc<Vec<u8>>> = stages.iter().map(|(s, _)| s.dxil()).collect::<Option<_>>()?;
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+            dxils.get(i).map_or(D3D12_SHADER_BYTECODE::default(), |d| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: d.as_ptr().cast(),
+                BytecodeLength: d.len(),
+            })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -706,9 +716,8 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let vs = &dxils[0];
+            match victory_shader::emit::rect_list_gs(vs, dxils.get(1).map(|d| &d[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -1013,7 +1022,8 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
     }
-    // SAFETY: a translation's own bytes, alive while its shader is.
+    // SAFETY: a translation's bytes, held while the pipeline is made
+    // (`dxils` in `HostPipeline::create`).
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 

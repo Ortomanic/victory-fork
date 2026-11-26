@@ -259,6 +259,8 @@ impl Recording {
                 let mut inner = held(&self.inner);
                 let Some(chunk) = inner.chunks.pop_front() else {
                     inner.scheduled = false;
+                    // (Neptune-VE) [`caught_up`] may wait for this.
+                    self.moved.notify_all();
                     return;
                 };
                 if inner.back == 0 {
@@ -369,6 +371,36 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
         .collect()
 }
 
+/// (Neptune-VE) The list of ours behind the title's list `this`, with
+/// everything the title wrote down so far translated: for a library that
+/// records onto the host list at the call (`crate::external`, the PC's
+/// upscaler), so that its commands come after the title's so far and before
+/// the title's next ones, as the console's library's do. The title's thread
+/// waits here; nobody else writes this list down (the title records a list
+/// on one thread at a time), so nothing more is translated into the list of
+/// ours until the title calls again. `None`: closed, or never begun.
+pub(super) fn caught_up(this: This) -> Option<This> {
+    let front = front(this);
+    if front.closed {
+        return None;
+    }
+    let recording = front.recording.clone()?;
+    front.hand_over();
+    let began = std::time::Instant::now();
+    let mut inner = held(&recording.inner);
+    while inner.scheduled || !inner.chunks.is_empty() {
+        inner = recording.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+    }
+    CAUGHT_UP[0].fetch_add(1, Relaxed);
+    CAUGHT_UP[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    (inner.back != 0).then_some(inner.back as This)
+}
+
+/// (Neptune-VE) Since the last line of the log: the times a title's thread
+/// waited for its list to be caught up ([`caught_up`]), and the
+/// microseconds it waited.
+static CAUGHT_UP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
@@ -383,6 +415,16 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    // Only when a library recorded onto a list (the PC upscaler,
+    // `VICTORY_FSR_DLL`): the line above is as it was otherwise.
+    let [caught, waited] = [0, 1].map(|i| CAUGHT_UP[i].swap(0, Relaxed));
+    if caught > 0 {
+        tracing::info!(
+            "lists caught up for a library at the call (the title's thread waits for their translation): {:.2} a frame, {:.2} ms a frame",
+            caught as f64 / frames,
+            waited as f64 / 1000.0 / frames
+        );
+    }
 }
 
 #[inline]

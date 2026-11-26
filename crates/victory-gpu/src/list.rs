@@ -187,6 +187,58 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// (Neptune-VE) Whether `this` is one of our command lists, by its function
+/// table. A PC library is handed a host list only for what the title passes
+/// as a list (`crate::external`), so the word is read as title memory may
+/// be: it need not be mapped.
+#[cfg(windows)]
+pub(crate) fn is_list(this: This) -> bool {
+    let mut word = [0; size_of::<usize>()];
+    if this.is_null() || !crate::host::read_into(this.cast(), &mut word) {
+        return false;
+    }
+    let table = usize::from_ne_bytes(word);
+    [
+        LIST_FUNCTIONS.0.as_ptr(),
+        NEWER_LIST_FUNCTIONS.0.as_ptr(),
+        THIN_FUNCTIONS.0.as_ptr(),
+        NEWER_THIN_FUNCTIONS.0.as_ptr(),
+    ]
+    .iter()
+    .any(|&functions| functions as usize == table)
+}
+
+/// (Neptune-VE) Runs `f` with the host list behind title list `this` and the
+/// draw state the title set on it, for host work the title does not know of
+/// (`crate::external`): what `f` records runs after the title's commands
+/// recorded before this call and before those after it, as the console's
+/// library's work does. A list whose calls are written down
+/// (`VICTORY_THIN=1`) has its host list behind a list of ours, once what
+/// was written so far is translated ([`thin::caught_up`]). `false` if `this`
+/// is not one of our lists or has no host list.
+#[cfg(windows)]
+pub(crate) fn with_host(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) -> bool {
+    if !is_list(this) {
+        return false;
+    }
+    let this = if thin::on() && host_list(this).is_none() {
+        match thin::caught_up(this) {
+            Some(back) => back,
+            None => return false,
+        }
+    } else {
+        this
+    };
+    if host_list(this).is_none() {
+        return false;
+    }
+    with_state(this, f);
+    true
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
@@ -899,7 +951,8 @@ extern "system" fn copy_buffer_region(
 
 /// Whether one of two resources is a target in a stand-in format and the
 /// other is not ([`crate::resource::target_format`]): their texels differ
-/// in size, so the host cannot copy between them (logged once).
+/// in size or, for R11G11B10 in place of R9G9B9E5, in layout, so the host
+/// cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
