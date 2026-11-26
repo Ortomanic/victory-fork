@@ -118,7 +118,10 @@ fn idle_without_rays(container: &[u8]) -> bool {
 }
 
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
+/// strands, by its name. `VICTORY_HAIR=0` leaves them out.
+/// (linux-mix) They run unless asked not to: on the NVIDIA/vkd3d-proton PC
+/// this branch is tested on the strands draw as they should, and without
+/// them the player's head is bare (runs next1 and nexthair, 2026-11-27).
 /// shortcut: left out, as some of them do not translate (an address from a
 /// phi) and the others draw lines all over the screen without them.
 #[cfg(windows)]
@@ -144,7 +147,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_none_or(|v| v != "0")) {
         return false;
     }
     const END: &[u8] = b"_Wrapped";
