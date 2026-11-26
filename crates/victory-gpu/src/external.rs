@@ -175,7 +175,7 @@ impl Pass<'_> {
             // writes, in another format: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(title)
-                .is_some_and(|source| crate::texture::alias(self.list, title, source));
+                .is_some_and(|source| crate::texture::alias(self.list, title, source.get()));
             // What the title fills itself is uploaded first
             // (`crate::texture::title_written`: no target, depth or
             // unordered access).
