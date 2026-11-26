@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -61,6 +63,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    // (Neptune-VE) Only when asked for and the PC DLL loads: the title's
+    // own upscaler runs otherwise.
+    #[cfg(windows)]
+    if fidelityfx::enabled() {
+        all.push(fidelityfx::module());
+    }
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]

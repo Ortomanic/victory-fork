@@ -12,8 +12,9 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees, `external` the
+//! host objects for PC libraries the title's calls are redirected to.
+//! Planned: `present` (swap chain).
 
 #[cfg(windows)]
 mod ambient;
@@ -33,6 +34,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -108,6 +111,11 @@ pub fn switched(switch: &str) -> Option<bool> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn frame_phase() -> u32 {
     copystat::phase()
+}
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};

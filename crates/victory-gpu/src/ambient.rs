@@ -112,6 +112,28 @@ fn air() -> f32 {
     })
 }
 
+/// What the estimate does with the light the title's own resolve left
+/// (`VICTORY_AMBIENT_LEFTOVER`). `keep` (0): the larger of the two per
+/// channel, the leftover's brightness bounded, as cool_fox had it. Its hue
+/// is kept, and without rays the leftover is whatever that memory held
+/// (Neptune-VE saw bright magenta on translucent surfaces): a sheet of paper
+/// on the cell wall of the first scene was a glowing magenta (run cf-skin0).
+/// `hue` (1): its brightness, within the same bound, in the estimate's colour.
+/// Unset or `off` (2): the estimate alone, as Neptune-VE has it; the sheet
+/// was white (run cf-skin1).
+fn leftover() -> u32 {
+    static SET: OnceLock<u32> = OnceLock::new();
+    *SET.get_or_init(|| leftover_mode(&std::env::var("VICTORY_AMBIENT_LEFTOVER").unwrap_or_default()))
+}
+
+fn leftover_mode(set: &str) -> u32 {
+    match set.trim() {
+        s if s.eq_ignore_ascii_case("keep") => 0,
+        s if s.eq_ignore_ascii_case("hue") => 1,
+        _ => 2,
+    }
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +159,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; uint leftover;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -325,6 +347,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
+    if (leftover == 2) {
+        light[p] = pack(found);
+        return;
+    }
+    if (leftover == 1) {
+        // Only its brightness counts: the colour of other memory is no light.
+        light[p] = pack(found * max(1.0, min(has, top) / max(dot(found, LUMA), 1e-6)));
+        return;
+    }
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));
 }
@@ -461,6 +492,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = leftover();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -509,6 +541,12 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        // The leftover: off unless set otherwise; the shader reads 0, 1, 2.
+        assert_eq!(leftover_mode(""), 2);
+        assert_eq!(leftover_mode("keep"), 0);
+        assert_eq!(leftover_mode(" Hue "), 1);
+        assert_eq!(leftover_mode("off"), 2);
+        assert_eq!(leftover_mode("whatever"), 2);
     }
 
     #[test]

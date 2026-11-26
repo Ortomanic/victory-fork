@@ -78,7 +78,8 @@ impl std::fmt::Debug for Shader {
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
 /// For the memory lines: containers kept and their bytes, translations
-/// kept and the bytes of their host code. None of them is ever let go.
+/// kept and the bytes of their host code. None of them is ever let go, but
+/// the host code with `VICTORY_DROP_DXIL=1` ([`drop_dxil`]).
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
@@ -139,10 +140,137 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// The host DXIL, moved out of `host`: read only to make a pipeline
+    /// ([`Shader::dxil`]).
+    dxil: Mutex<Dxil>,
+}
+
+/// A translated shader's host DXIL ([`Translated::dxil`]).
+#[cfg(windows)]
+struct Dxil {
+    /// The bytes, while they are kept.
+    bytes: Option<Arc<Vec<u8>>>,
+    /// Their BLAKE3, once they were let go ([`drop_dxil`]): what is read
+    /// back must be the same code, as the root signatures of the shader's
+    /// pipelines are made from the first translation's bindings
+    /// (`Translated::host`).
+    let_go: Option<blake3::Hash>,
+}
+
+#[cfg(windows)]
+impl Dxil {
+    /// The bytes, read back by `read` if they were let go ([`Dxil::let_go`]),
+    /// and whether they were; an error if `read` fails or gives other code
+    /// than was let go.
+    fn get(&mut self, read: impl FnOnce() -> Result<Vec<u8>, String>) -> Result<(Arc<Vec<u8>>, bool), String> {
+        if let Some(bytes) = &self.bytes {
+            return Ok((bytes.clone(), false));
+        }
+        let again = read()?;
+        if self.let_go != Some(blake3::hash(&again)) {
+            return Err("the code read back from the shader cache is not the code let go".into());
+        }
+        let again = Arc::new(again);
+        self.bytes = Some(again.clone());
+        Ok((again, true))
+    }
+
+    /// Lets the bytes go, their hash kept; how many they were (0: none were
+    /// held).
+    fn let_go(&mut self) -> usize {
+        let Some(bytes) = self.bytes.take() else { return 0 };
+        self.let_go.get_or_insert_with(|| blake3::hash(&bytes));
+        bytes.len()
+    }
+}
+
+/// (Neptune-VE) `VICTORY_DROP_DXIL=1` (off by default): a shader's host DXIL
+/// is let go once a pipeline is made with it, and read back from the shader
+/// cache when another pipeline of it is made ([`Shader::dxil`]); without the
+/// switch every translated shader keeps it for good. Nothing else reads it
+/// after its pipeline is made: the pipeline library and `victory warm` make
+/// pipelines from it the same way, the recorder (`crate::replay`) copies it
+/// when the pipeline is created, and a removed device ends the run rather
+/// than making its pipelines again. Only while translations are kept on disk
+/// (`crate::shader_cache::on_disk`): reading it back would be translating it
+/// again.
+#[cfg(windows)]
+pub(crate) fn drop_dxil() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_DXIL").is_some_and(|v| v == "1"))
+}
+
+/// Host DXIL bytes let go since the start, times read back and the bytes
+/// read back ([`drop_dxil`]).
+#[cfg(windows)]
+static DXIL_DROPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// (Neptune-VE) With `VICTORY_DROP_DXIL=1`, for the lines every few seconds
+/// (`crate::host`): what was let go and read back since the start.
+#[cfg(windows)]
+pub(crate) fn dxil_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !drop_dxil() {
+        return;
+    }
+    let [let_go, back, back_bytes] = [0, 1, 2].map(|i| DXIL_DROPS[i].load(Relaxed));
+    tracing::info!(
+        "translated shaders' host code (VICTORY_DROP_DXIL=1), since the start: {} MB let go once a pipeline was made with \
+         it, read back from the shader cache {back} times ({} MB); {} MB kept now",
+        let_go >> 20,
+        back_bytes >> 20,
+        KEPT[3].load(Relaxed) >> 20
+    );
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// The host DXIL of a translated shader: kept, or read back from the
+    /// shader cache after [`Shader::release_dxil`]. `None` if the shader
+    /// does not translate, or if what comes back is not the code that was
+    /// let go.
+    pub(crate) fn dxil(&self) -> Option<Arc<Vec<u8>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = self.translated()?;
+        let mut held = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        match held.get(|| crate::shader_cache::host_shader(&self.container).map(|again| again.dxil)) {
+            Ok((bytes, false)) => Some(bytes),
+            Ok((bytes, true)) => {
+                DXIL_DROPS[1].fetch_add(1, Relaxed);
+                DXIL_DROPS[2].fetch_add(bytes.len() as u64, Relaxed);
+                KEPT[3].fetch_add(bytes.len() as u64, Relaxed);
+                Some(bytes)
+            }
+            Err(e) => {
+                // Logged for the first few: each pipeline of the shader asks.
+                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SAID.fetch_add(1, Relaxed) < 20 {
+                    tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        error = %e,
+                        "the host code let go (VICTORY_DROP_DXIL=1) does not come back: no pipeline is made with it"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// With `VICTORY_DROP_DXIL=1` ([`drop_dxil`]): lets the host DXIL go once
+    /// a pipeline is made with it. One being made meanwhile holds its own
+    /// `Arc` of the bytes until it is done.
+    pub(crate) fn release_dxil(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !drop_dxil() || !crate::shader_cache::on_disk() {
+            return;
+        }
+        let Some(Some(t)) = self.translated.get() else { return };
+        let bytes = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).let_go() as u64;
+        KEPT[3].fetch_sub(bytes, Relaxed);
+        DXIL_DROPS[0].fetch_add(bytes, Relaxed);
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -157,12 +285,15 @@ impl Shader {
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
                     if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                        let held = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+                        let dxil = held.bytes.as_deref().map_or(&[][..], Vec::as_slice);
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), dxil);
                     }
                 }
                 if let Ok(t) = &done {
+                    let bytes = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).bytes.as_ref().map_or(0, |d| d.len());
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    KEPT[3].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -206,7 +337,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let mut host = crate::shader_cache::host_shader(container)?;
+    // (Neptune-VE) Out of `host`, so that `VICTORY_DROP_DXIL=1` can let it go.
+    let dxil = Mutex::new(Dxil {
+        bytes: Some(Arc::new(std::mem::take(&mut host.dxil))),
+        let_go: None,
+    });
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -232,6 +368,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
+        dxil,
     })
 }
 
@@ -908,5 +1045,36 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// (Neptune-VE) Host code let go (`VICTORY_DROP_DXIL=1`) comes back only
+    /// as the bytes it was, and a pipeline being made keeps its own.
+    #[cfg(windows)]
+    #[test]
+    fn host_code_let_go_comes_back_only_as_it_was() {
+        let code = b"DXBC and the rest".to_vec();
+        let mut held = Dxil {
+            bytes: Some(Arc::new(code.clone())),
+            let_go: None,
+        };
+        let unread = || -> Result<Vec<u8>, String> { panic!("read back while it is kept") };
+        let (making, back) = held.get(unread).unwrap();
+        assert!(!back);
+        assert_eq!(held.let_go(), code.len());
+        assert_eq!(held.let_go(), 0, "let go once");
+        assert_eq!(*making, code, "the pipeline being made keeps its bytes");
+        // Other code, or none, is refused, and the next ask reads again.
+        assert!(held.get(|| Ok(b"DXBC and another".to_vec())).is_err());
+        assert!(held.get(|| Err("no entry".into())).is_err());
+        assert!(held.bytes.is_none());
+        let (again, back) = held.get(|| Ok(code.clone())).unwrap();
+        assert!(back);
+        assert_eq!(*again, code);
+        let (kept, back) = held.get(unread).unwrap();
+        assert!(!back && Arc::ptr_eq(&kept, &again));
+        // Let go again, it is checked against the same hash.
+        assert_eq!(held.let_go(), code.len());
+        assert!(held.get(|| Ok(code[1..].to_vec())).is_err());
+        assert!(held.get(|| Ok(code.clone())).is_ok());
     }
 }

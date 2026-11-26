@@ -32,6 +32,13 @@ pub fn use_shader_cache(dir: PathBuf) {
     }
 }
 
+/// Whether translations are kept on disk ([`use_shader_cache`]): then
+/// [`host_shader`] reads one made before instead of translating again
+/// (`crate::pipeline::drop_dxil`).
+pub(crate) fn on_disk() -> bool {
+    CACHE.get().is_some()
+}
+
 /// Shaders found in the cache and translated since the start.
 pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
@@ -75,6 +82,10 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // (Neptune-VE) The NaN guard changes colour exports and typed
+            // stores: a translation made without it must not serve a run
+            // with it, nor the other way round.
+            "VICTORY_NAN_GUARD",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -267,6 +278,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -335,6 +351,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,6 +366,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -379,6 +401,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

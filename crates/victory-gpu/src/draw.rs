@@ -162,9 +162,13 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 40; 0: never, as before), and the
 /// milliseconds it may take just before a draw of the title's decoration
-/// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
+/// bake (`VICTORY_BAKE_TEXTURES_MS`, 10000; 0: nothing special).
+///
+/// (ultimate) 12 and 1,500, as cool_fox had them, left a face of coloured
+/// noise and one of blocks in the first cutscene (runs cf-skin0/1); 40 and
+/// 10,000, Neptune-VE's, baked both whole, with no slower frames.
 ///
 /// The pass ran only from the first world frame on, where it met some
 /// 24,000 slots at once and needed 60-80 frames for them. The title bakes
@@ -179,7 +183,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 40), ms("VICTORY_BAKE_TEXTURES_MS", 10000))
     })
 }
 
@@ -1294,6 +1298,23 @@ impl State {
         }
     }
 
+    /// (Neptune-VE) Host work the title does not know of was recorded onto
+    /// the host list (a PC library, `crate::external`). Such a library is
+    /// compute work: it sets descriptor heaps, a root signature and a
+    /// pipeline of its own (and root arguments, which every draw and
+    /// dispatch sets anyway). The next draw or dispatch sets the title's
+    /// again (`bind`, told the host list has none of them). Targets,
+    /// viewports, scissors and the rest stay as the title set them: a
+    /// compute library leaves them alone, and setting the targets again
+    /// would make their views from the handles' descriptors as they are now
+    /// ([`State::replay`]), not as they were when the title set them.
+    pub(crate) fn after_external(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.host_heaps_set = false;
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
@@ -1643,7 +1664,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, &t.host.half_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3625,14 +3646,50 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
+        // (fxceless PR 927) The view shown in place of the title's at dword `at` of the table in
+        // root parameter `slot`, if the shader moves halves there and the title's view is a
+        // 16-bit float or signed buffer view: such a table is made afresh for the draw.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         for group in &plan.groups {
             let slot = group.slot;
             let needs_snapshot = group.has_cbv
@@ -3686,6 +3743,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3703,6 +3769,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    if half.contains(&(slot, k * 8)) {
+                        h.add([1, k, 0x4861_6c66]);
+                    }
                 }
                 (table, n, h.0)
             };
@@ -3847,7 +3916,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
