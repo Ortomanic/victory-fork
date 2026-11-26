@@ -22,13 +22,55 @@ The base carries a port of Marvisak/VIctory#1885 for the same problem. Under vkd
 at `cfg_structurizer.cpp:3486` on this title (one pipeline never finished, 350 ms a frame); with the pass from
 PR #257 there are none.
 
+## What this branch changes over its parts
+
+- **Ray tracing is on by default.** The structure builder and the programs that reach memory by address run
+  unless `VICTORY_BVH_BUILDER=0` and `VICTORY_RAYS=0` are set. The code is the base's (avatarmanz's and
+  DoubleGhosty's work); here only the default changed, because on this PC all 53 builder programs get host
+  pipelines and it runs without a fault at the same frame time as without it. Whether traced light is what
+  lights the shade has not been shown yet: the ambient stand-in was on in every run.
+- **Hair strands are drawn by default** (`VICTORY_HAIR=0` leaves them out, as cool_fox `f4164f8` did). Without
+  them the player's head is bare here; with them the hair is right.
+- **One back edge per loop in emitted DXIL** (above).
+
 ## Settings and results here
 
-Series S profile, a PC FidelityFX upscaler DLL, `VKD3D_CONFIG=no_upload_hvv`, `VICTORY_LEVELS_ON_DEMAND` unset
-(as the willy package found), `VICTORY_RELAY_COPY=0` (ad3lre's fork links it to device removal on NVIDIA),
-renderer ports 1 and 5 on. From a save in the open world, card otherwise idle: 68 ms a frame (about 15 fps) at
-5,000 to 7,000 draws, 11.2 GB of the card at most, no refused texture uploads, picture lit and textured on foot
-and driving. One run; a handful of shorter ones agree. Not yet played for a long session.
+Series S profile, a PC FidelityFX upscaler DLL, `VKD3D_CONFIG=no_upload_hvv` and:
+
+```
+VICTORY_AMBIENT_AIR=1.5 VICTORY_AMBIENT=0.8 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1
+VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1 VICTORY_JOIN_PARTS=8 VICTORY_INDIRECT_WINDOW=1
+VICTORY_INDIRECT_BATCH=2 VICTORY_CARD_STEPS=2 VICTORY_CARD_AWAKE=1 VICTORY_CARD_BUFFERS_MIN_KB=64
+VICTORY_MAP_THREADS=1 VICTORY_SHOW_AFTER=1 VICTORY_THIN=1 VICTORY_UPLOAD_AHEAD=1 VICTORY_PORT_CBV=1
+VICTORY_PORT_CONSTANTS=1 VICTORY_VRAM_IDLE_MS=6000,1500,700 VICTORY_OVERLAY=0 VICTORY_PIPELINE_BOOK=1
+VICTORY_RELAY_COPY=0
+```
+
+`VICTORY_LEVELS_ON_DEMAND` is left unset, as the willy package found. `VICTORY_RELAY_COPY=0` differs from
+`Play-VIctory.cmd`, which sets 1: ad3lre's fork links 1 to device removal on NVIDIA, and the device faults seen
+here stopped once it was 0 (a handful of runs, not a proof). The `.cmd` launchers are the other forks' and have
+not been run by us; nothing here has been tested on Windows.
+
+Measured from a save in the open world, 5,000 to 7,000 draws a frame:
+
+| | Frame | Whole card in use, at most |
+|---|---|---|
+| Rays off, card otherwise idle (one run) | 68 ms, about 15 fps | 11.2 GB |
+| Rays off, another game holding about 3.2 GB (four runs) | 78 to 82 ms | 9.5 to 9.8 GB |
+| Rays on, the same other game running (three runs) | 69 to 85 ms once settled | 11.1 to 12.1 GB |
+
+No refused texture uploads and no device fault in any of them; picture lit and textured on foot and driving.
+The card figures are for the whole card, desktop and the other game included. No run with rays on has had the
+card to itself, and none is longer than six minutes.
+
+**On a 12 GB card** the texture budget follows the card, so it should fit, but rays cost roughly 2 GB more
+here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
+`VICTORY_TEXTURE_MAX_DIM=1024` (ad3lre's cap).
+
+**Warm the caches first.** `victory.exe shaders <game exe>` translates every shader (about two minutes here);
+after one played session, `victory.exe warm-used <game exe>` makes the pipelines that session drew (3,187 in
+three and a half minutes here). Without them passes are missing until their pipelines are made: on a first
+start with rays on the water was not drawn at all.
 
 On Wine the largest single gain is outside this tree: Wine's server walks a list of the process's views on
 every map and unmap (Wine bug 60868); with a tree lookup the frame went from about 105 to about 80 ms here
@@ -36,7 +78,11 @@ every map and unmap (Wine bug 60868); with a tree lookup the frame went from abo
 
 ## Known problems
 
+- With rays on, every start spends its first one to two minutes in the world at about 3 fps while some 400
+  pipelines are made, also after `warm-used`; then it settles. Under vkd3d-proton the host pipeline library is
+  refused ("no host pipeline library: pipelines are not kept"), which may be why; not looked into yet.
+- Three compute programs never get a host pipeline with rays on and their dispatches are dropped
+  (`02384a60fda6f2d0`, `5dc3b25986622949`, `6f225b641c5b0708`); nothing is visibly missing.
 - 27 console programs written for 64-lane waves have no 32-lane form here and are left out.
 - About 2.5 GB of the card is taken by the driver outside any allocation while vkd3d-proton uses
   `VK_EXT_descriptor_heap` (measured here; not solved).
-- Ray-traced light does not run; a stand-in lights what the sun does not reach.
