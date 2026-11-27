@@ -70,7 +70,7 @@ said, each run 40 or more settled readings at 5,000 to 7,000 draws a frame:
 A 35 minute session of scripted walking and jumping with `VICTORY_RELAY_COPY=1` ran its whole length with no
 device fault: 53 ms at 5,000 to 7,000 draws, 57 ms at 7,000 to 9,500, 62 ms at 9,500 to 13,000. The whole card
 held 10.5 to 13 GB (desktop included), no texture upload was refused, and the picture stayed lit and textured.
-In about 60 starts that night the device faulted once, at the menu (Xid 13, with relay copy 0).
+In about 70 starts that night the device faulted once, at the menu (Xid 13, with relay copy 0).
 
 Not gains here, each one run or a few: a `znver4` build, `VICTORY_SUBMIT_FRAMES` 0/2/3, `VICTORY_WIDE_SPIN`,
 `VICTORY_THIN=0 VICTORY_JOIN_PARTS=0`, half render scale, foxhound's own build and settings (56 to 60 ms with
@@ -99,7 +99,7 @@ every map and unmap (Wine bug 60868); with a tree lookup the frame went from abo
   in one process, then 52 s when ten processes shared the folder). The game's own file had also stopped
   growing at 7.4 GB, so its ray-tracing pipelines were compiled again at every start: two minutes at 3 fps.
   With `__GL_SHADER_DISK_CACHE_PATH` pointing at an empty folder the game fills the cache itself: the first
-  start is that slow once, later ones mostly show the world at once. Not every one: about one start in four
+  start is that slow once, later ones mostly show the world at once. Not every one: 5 of 33 starts
   still made some 400 pipelines again, after sessions that were killed and after ones that ended by
   themselves, with the same translations logged. Why is not known.
 - `VICTORY_PIPELINE_WAIT_MS=0` is no way around the first start: the frame rate holds, but for those three
