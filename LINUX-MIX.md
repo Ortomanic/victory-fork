@@ -48,28 +48,39 @@ VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1 VICTORY_JOIN_PARTS=8 VICTORY_IN
 VICTORY_INDIRECT_BATCH=2 VICTORY_CARD_STEPS=2 VICTORY_CARD_AWAKE=1 VICTORY_CARD_BUFFERS_MIN_KB=64
 VICTORY_MAP_THREADS=1 VICTORY_SHOW_AFTER=1 VICTORY_THIN=1 VICTORY_UPLOAD_AHEAD=1 VICTORY_PORT_CBV=1
 VICTORY_PORT_CONSTANTS=1 VICTORY_VRAM_IDLE_MS=6000,1500,700 VICTORY_OVERLAY=0 VICTORY_PIPELINE_BOOK=1
-VICTORY_RELAY_COPY=0
+VICTORY_RELAY_COPY=1
 ```
 
-`VICTORY_LEVELS_ON_DEMAND` is left unset, as the willy package found. `VICTORY_RELAY_COPY=0` differs from
-`Play-VIctory.cmd`, which sets 1: ad3lre's fork links 1 to device removal on NVIDIA, and the device faults seen
-here stopped once it was 0 (a handful of runs, not a proof). The `.cmd` launchers are the other forks' and have
-not been run by us; nothing here has been tested on Windows.
+`VICTORY_LEVELS_ON_DEMAND` is left unset, as the willy package found. `VICTORY_RELAY_COPY` was 0 here for a
+day on the suspicion that 1 removed the device (ad3lre's fork says so for NVIDIA); the measurements below put
+it back to 1. The `.cmd` launchers are the other forks' and have not been run by us; nothing here has been
+tested on Windows.
 
-Measured from a save in the open world, 5,000 to 7,000 draws a frame:
+Measured on 2026-11-27 from a save in the open world, the card to itself, rays on, 1920x1080 output unless
+said, each run 40 or more settled readings at 5,000 to 7,000 draws a frame:
 
-| | Frame | Whole card in use, at most |
-|---|---|---|
-| Rays off, card otherwise idle (one run) | 68 ms, about 15 fps | 11.2 GB |
-| Rays off, another game holding about 3.2 GB (four runs) | 78 to 82 ms | 9.5 to 9.8 GB |
-| Rays on, the same other game running (three runs) | 69 to 85 ms once settled | 11.1 to 12.1 GB |
+| | Frame |
+|---|---|
+| `VICTORY_RELAY_COPY=0` (three runs) | 62 to 63 ms, 16 fps |
+| `VICTORY_RELAY_COPY=1` (six runs) | 53 to 55 ms, 18 to 19 fps |
+| the same, `VICTORY_OUTPUT=1664x936` | 51 ms, 19.6 fps |
+| the same, `VICTORY_OUTPUT=1280x720` | 50 ms, 20.2 fps |
+| rays off (`VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0`), relay copy 0 | 72 against 73 ms in the same hour: no difference |
 
-No refused texture uploads and no device fault in any of them; picture lit and textured on foot and driving.
-The card figures are for the whole card, desktop and the other game included. No run with rays on has had the
-card to itself, and none is longer than six minutes.
+A 35 minute session of scripted walking and jumping with `VICTORY_RELAY_COPY=1` ran its whole length with no
+device fault: 53 ms at 5,000 to 7,000 draws, 57 ms at 7,000 to 9,500, 62 ms at 9,500 to 13,000. The whole card
+held 10.5 to 13 GB (desktop included), no texture upload was refused, and the picture stayed lit and textured.
+In about 60 starts that night the device faulted once, at the menu (Xid 13, with relay copy 0).
 
-**On a 12 GB card** the texture budget follows the card, so it should fit, but rays cost roughly 2 GB more
-here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
+Not gains here, each one run or a few: a `znver4` build, `VICTORY_SUBMIT_FRAMES` 0/2/3, `VICTORY_WIDE_SPIN`,
+`VICTORY_THIN=0 VICTORY_JOIN_PARTS=0`, half render scale, foxhound's own build and settings (56 to 60 ms with
+relay copy 1). Other programs on the card cost a great deal: with a desktop stream idling at 20% of the card
+the same runs read 72 to 74 ms.
+
+Settings reach the title through the environment; a sandbox that clears it must pass each `VICTORY_*` one on.
+
+**On a 12 GB card** the texture budget follows the card, so it should fit; rays showed no steady cost in
+card memory here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
 `VICTORY_TEXTURE_MAX_DIM=1024` (ad3lre's cap).
 
 **Translate the shaders first.** `victory.exe shaders <game folder>\shaders.rpf` translates every shader (about two minutes here);
@@ -88,10 +99,18 @@ every map and unmap (Wine bug 60868); with a tree lookup the frame went from abo
   in one process, then 52 s when ten processes shared the folder). The game's own file had also stopped
   growing at 7.4 GB, so its ray-tracing pipelines were compiled again at every start: two minutes at 3 fps.
   With `__GL_SHADER_DISK_CACHE_PATH` pointing at an empty folder the game fills the cache itself: the first
-  start is that slow once, later ones show the world at once at 10 to 13 fps. What a session compiled seems to
-  be kept only if it ends by itself and is not killed (one comparison).
+  start is that slow once, later ones mostly show the world at once. Not every one: about one start in four
+  still made some 400 pipelines again, after sessions that were killed and after ones that ended by
+  themselves, with the same translations logged. Why is not known.
 - `VICTORY_PIPELINE_WAIT_MS=0` is no way around the first start: the frame rate holds, but for those three
   minutes the picture is glare and lights on black.
+- Memory of our own grows while roaming: 6.6 to 10.8 GB private in 30 minutes (about 140 MB a minute). A
+  session of some hours will want watching on a PC with less than 64 GB.
+- DoubleGhosty/cool_fox after `92afbcf` is not merged yet. Tried at `69718c0`: `2a1965f` (a dispatch waits for
+  its compute pipeline) ends the title at loading here (a write to 0, with rays on), and `76c4a28` (renderer
+  port 1, in-place arguments clamped alone) takes the card's share of a frame from 25 to 82 ms unless
+  `VICTORY_PORT_CONSTANTS_ORDER_ALONE=0`. With the first reverted and the second switched off it measures the
+  same as this branch or a little slower (54 to 58 ms).
 - Three compute programs never get a host pipeline with rays on and their dispatches are dropped
   (`02384a60fda6f2d0`, `5dc3b25986622949`, `6f225b641c5b0708`); nothing is visibly missing.
 - 27 console programs written for 64-lane waves have no 32-lane form here and are left out.
