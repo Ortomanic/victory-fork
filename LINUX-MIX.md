@@ -35,6 +35,11 @@ PR #257 there are none.
 
 ## Settings and results here
 
+`./play-linux.sh` sets all of the below, the driver cache folder from the known problems included
+(`VICTORY_GAME_DIR=/path/to/your/dump ./play-linux.sh`, `--dry-run` to see what it would do). It is a
+starting point: our runs went through a sandboxed harness that sets the same variables, and the script itself
+has only been dry-run.
+
 Series S profile, a PC FidelityFX upscaler DLL, `VKD3D_CONFIG=no_upload_hvv` and:
 
 ```
