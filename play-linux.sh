@@ -33,7 +33,8 @@ export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP="${__GL_SHADER_DISK_CACHE_SKIP_CLEANU
 # Upload memory in system RAM: about a fifth faster here (104 against 125 ms a frame on another build).
 export VKD3D_CONFIG="${VKD3D_CONFIG-no_upload_hvv}"
 
-# The settings of LINUX-MIX.md. If the device is removed, try VICTORY_RELAY_COPY=0 (about 15% slower here).
+# The settings of LINUX-MIX.md. VICTORY_RELAY_COPY=1 is about 15% faster here, but a played session with it
+# showed black artifacts in the sky and ended in a device fault on NVIDIA; see LINUX-MIX.md.
 while read -r name value; do
   [[ -n ${!name+x} ]] || export "$name=$value"
 done <<'SETTINGS'
@@ -59,7 +60,7 @@ VICTORY_PORT_CONSTANTS 1
 VICTORY_VRAM_IDLE_MS 6000,1500,700
 VICTORY_OVERLAY 0
 VICTORY_PIPELINE_BOOK 1
-VICTORY_RELAY_COPY 1
+VICTORY_RELAY_COPY 0
 VICTORY_LOG warn
 SETTINGS
 # Ray tracing and hair strands are on by default in this branch. On a card with less room:

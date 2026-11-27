@@ -48,13 +48,15 @@ VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1 VICTORY_JOIN_PARTS=8 VICTORY_IN
 VICTORY_INDIRECT_BATCH=2 VICTORY_CARD_STEPS=2 VICTORY_CARD_AWAKE=1 VICTORY_CARD_BUFFERS_MIN_KB=64
 VICTORY_MAP_THREADS=1 VICTORY_SHOW_AFTER=1 VICTORY_THIN=1 VICTORY_UPLOAD_AHEAD=1 VICTORY_PORT_CBV=1
 VICTORY_PORT_CONSTANTS=1 VICTORY_VRAM_IDLE_MS=6000,1500,700 VICTORY_OVERLAY=0 VICTORY_PIPELINE_BOOK=1
-VICTORY_RELAY_COPY=1
+VICTORY_RELAY_COPY=0
 ```
 
-`VICTORY_LEVELS_ON_DEMAND` is left unset, as the willy package found. `VICTORY_RELAY_COPY` was 0 here for a
-day on the suspicion that 1 removed the device (ad3lre's fork says so for NVIDIA); the measurements below put
-it back to 1. The `.cmd` launchers are the other forks' and have not been run by us; nothing here has been
-tested on Windows.
+`VICTORY_LEVELS_ON_DEMAND` is left unset, as the willy package found. **`VICTORY_RELAY_COPY=0`** differs from
+`Play-VIctory.cmd`, which sets 1. With 1 the frame is about 15% shorter here (table below) and eight unattended
+runs and two sessions of 14 and 35 minutes had no fault; then the first played session with it showed black
+artifacts popping into the sky and ended in a device fault (Xid 13) after six minutes. ad3lre's fork links 1
+to device removal on NVIDIA as well. It stays 0. The `.cmd` launchers are the other forks' and have not been
+run by us; nothing here has been tested on Windows.
 
 Measured on 2026-11-27 from a save in the open world, the card to itself, rays on, 1920x1080 output unless
 said, each run 40 or more settled readings at 5,000 to 7,000 draws a frame:
@@ -67,8 +69,8 @@ said, each run 40 or more settled readings at 5,000 to 7,000 draws a frame:
 | the same, `VICTORY_OUTPUT=1280x720` | 50 ms, 20.2 fps |
 | rays off (`VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0`), relay copy 0 | 72 against 73 ms in the same hour: no difference |
 
-A 35 minute session of scripted walking and jumping with `VICTORY_RELAY_COPY=1` ran its whole length with no
-device fault: 53 ms at 5,000 to 7,000 draws, 57 ms at 7,000 to 9,500, 62 ms at 9,500 to 13,000. The whole card
+A 35 minute unattended session of scripted walking and jumping with `VICTORY_RELAY_COPY=1` ran its whole
+length with no device fault (a played one did not, see above): 53 ms at 5,000 to 7,000 draws, 57 ms at 7,000 to 9,500, 62 ms at 9,500 to 13,000. The whole card
 held 10.5 to 13 GB (desktop included), no texture upload was refused, and the picture stayed lit and textured.
 In about 70 starts that night the device faulted once, at the menu (Xid 13, with relay copy 0).
 
