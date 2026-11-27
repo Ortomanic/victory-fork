@@ -63,8 +63,9 @@ VICTORY_PIPELINE_BOOK 1
 VICTORY_RELAY_COPY 0
 VICTORY_LOG warn
 SETTINGS
-# Ray tracing and hair strands are on by default in this branch. On a card with less room:
-#   VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0 ./play-linux.sh        then also VICTORY_TEXTURE_MAX_DIM=1024
+# Hair strands are on by default in this branch; ray tracing is off (it ran at 1.5 fps away from the start
+# here): VICTORY_BVH_BUILDER=1 VICTORY_RAYS=1 ./play-linux.sh tries it. On a card with less room:
+#   VICTORY_TEXTURE_MAX_DIM=1024 ./play-linux.sh
 
 if (( dry )); then
   env | grep -E '^(VICTORY_|__GL_SHADER|VKD3D_CONFIG)' | sort

@@ -24,11 +24,13 @@ PR #257 there are none.
 
 ## What this branch changes over its parts
 
-- **Ray tracing is on by default.** The structure builder and the programs that reach memory by address run
-  unless `VICTORY_BVH_BUILDER=0` and `VICTORY_RAYS=0` are set. The code is the base's (avatarmanz's and
-  DoubleGhosty's work); here only the default changed, because on this PC all 53 builder programs get host
-  pipelines and it runs without a fault at the same frame time as without it. Whether traced light is what
-  lights the shade has not been shown yet: the ambient stand-in was on in every run.
+- **Ray tracing runs here, and is off by default** (`VICTORY_BVH_BUILDER=1 VICTORY_RAYS=1` turn it on). The
+  code is the base's (avatarmanz's and DoubleGhosty's work). On this PC all 53 builder programs get host
+  pipelines and it runs without a fault; around the save's house it costs nothing measurable. Ridden away
+  from the house on a bike, the card took 550 to 680 ms a frame (1.5 fps) in two runs at the same place, with
+  card memory at 7.9 of 10 GB and no pipeline being made; with rays off the same ride holds its rate (the
+  player's report, not a logged run). It was this branch's default for one day, on tests that never left the
+  house. Whether traced light is what lights the shade has not been shown: the ambient stand-in was on.
 - **Hair strands are drawn by default** (`VICTORY_HAIR=0` leaves them out, as cool_fox `f4164f8` did). Without
   them the player's head is bare here; with them the hair is right.
 - **One back edge per loop in emitted DXIL** (above).
@@ -58,7 +60,8 @@ artifacts popping into the sky and ended in a device fault (Xid 13) after six mi
 to device removal on NVIDIA as well. It stays 0. The `.cmd` launchers are the other forks' and have not been
 run by us; nothing here has been tested on Windows.
 
-Measured on 2026-11-27 from a save in the open world, the card to itself, rays on, 1920x1080 output unless
+Measured on 2026-11-27 from a save in the open world, the card to itself, standing by the house, rays on (they
+cost nothing there, last row), 1920x1080 output unless
 said, each run 40 or more settled readings at 5,000 to 7,000 draws a frame:
 
 | | Frame |
@@ -81,8 +84,7 @@ the same runs read 72 to 74 ms.
 
 Settings reach the title through the environment; a sandbox that clears it must pass each `VICTORY_*` one on.
 
-**On a 12 GB card** the texture budget follows the card, so it should fit; rays showed no steady cost in
-card memory here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
+**On a 12 GB card** the texture budget follows the card, so it should fit. If textures are refused, try
 `VICTORY_TEXTURE_MAX_DIM=1024` (ad3lre's cap).
 
 **Translate the shaders first.** `victory.exe shaders <game folder>\shaders.rpf` translates every shader (about two minutes here);
