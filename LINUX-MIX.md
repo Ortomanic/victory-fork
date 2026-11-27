@@ -67,10 +67,9 @@ card to itself, and none is longer than six minutes.
 here. If textures are refused or the frame collapses, try `VICTORY_BVH_BUILDER=0 VICTORY_RAYS=0` first, then
 `VICTORY_TEXTURE_MAX_DIM=1024` (ad3lre's cap).
 
-**Warm the caches first.** `victory.exe shaders <game folder>\shaders.rpf` translates every shader (about two minutes here);
-after one played session, `victory.exe warm --used` makes the pipelines that session drew (3,187 in
-three and a half minutes here). Without them passes are missing until their pipelines are made: on a first
-start with rays on the water was not drawn at all.
+**Translate the shaders first.** `victory.exe shaders <game folder>\shaders.rpf` translates every shader (about two minutes here);
+`victory.exe warm --used` makes the pipelines earlier sessions drew, but with NVIDIA on Linux what it
+compiles does not reach the game (see the known problems); there the first session fills the cache.
 
 On Wine the largest single gain is outside this tree: Wine's server walks a list of the process's views on
 every map and unmap (Wine bug 60868); with a tree lookup the frame went from about 105 to about 80 ms here
@@ -78,9 +77,16 @@ every map and unmap (Wine bug 60868); with a tree lookup the frame went from abo
 
 ## Known problems
 
-- With rays on, every start spends its first one to two minutes in the world at about 3 fps while some 400
-  pipelines are made, also after `warm --used`; then it settles. Under vkd3d-proton the host pipeline library is
-  refused ("no host pipeline library: pipelines are not kept"), which may be why; not looked into yet.
+- **Slow starts with rays on were the driver's shader cache, and are solved here by a fresh one.** NVIDIA's
+  Linux driver gives each process that has the cache open a file of its own and reads only that one, so what
+  the processes of `warm --used` compile never reaches the game (the same 150 pipelines: 49 s, then 2 s again
+  in one process, then 52 s when ten processes shared the folder). The game's own file had also stopped
+  growing at 7.4 GB, so its ray-tracing pipelines were compiled again at every start: two minutes at 3 fps.
+  With `__GL_SHADER_DISK_CACHE_PATH` pointing at an empty folder the game fills the cache itself: the first
+  start is that slow once, later ones show the world at once at 10 to 13 fps. What a session compiled seems to
+  be kept only if it ends by itself and is not killed (one comparison).
+- `VICTORY_PIPELINE_WAIT_MS=0` is no way around the first start: the frame rate holds, but for those three
+  minutes the picture is glare and lights on black.
 - Three compute programs never get a host pipeline with rays on and their dispatches are dropped
   (`02384a60fda6f2d0`, `5dc3b25986622949`, `6f225b641c5b0708`); nothing is visibly missing.
 - 27 console programs written for 64-lane waves have no 32-lane form here and are left out.
