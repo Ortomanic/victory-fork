@@ -13,6 +13,7 @@ project of its own: what it does well comes from the trees below. No game files 
 | Texture dimension cap, idle-texture override, pool caps, memory census | [ad3lre/victory-nvidia-8gb](https://github.com/ad3lre/victory-nvidia-8gb) at `9e87ec8` (the state before its telemetry was added), with soldsawn's NVIDIA work it carries | ad3lre, soldsawn, Dabagh, BvtterFvcker and others |
 | Face bake timing and 16-bit views (fxceless PR #927 by tippythetaidum), NaN guard, R11G11B10 stand-in, FidelityFX redirect, keyboard and mouse | the cool_fox "willy" source package, build `30e54b4` (its README credits Neptune-VE, proneonn/Vertex and others) | its authors; committed here as packaged |
 | One back edge per loop in emitted DXIL, including a block that continues two loops | [Ortomanic/victory-fork](https://github.com/Ortomanic/victory-fork) (fxceless PR #257) | Ortomanic |
+| Static samplers made in one kept order, so the NVIDIA driver's disk cache answers and starts do not recompile hundreds of pipelines (`VICTORY_SAMPLER_ORDER=0`: off). Here: 8 of 8 starts with 1-9 slow pipelines | [fxceless/victory-fork](https://github.com/fxceless/victory-fork) `9e90746` | fxceless |
 
 The merge commits name the exact commits taken. Where two trees had the same feature, the base's was kept.
 
