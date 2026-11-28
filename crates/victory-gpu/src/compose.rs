@@ -105,6 +105,8 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
         RegisterSpace: 0,
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     };
+    // Its static sampler given its place in the driver's table like the title's (`sampler_order`, fxceless 9e90746).
+    crate::pipeline::sampler_order::before(device, std::slice::from_ref(&sampler));
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
